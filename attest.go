@@ -106,16 +106,30 @@ func (u *Updater) pendingAttestation() (*state, bool) {
 }
 
 // decide resolves an in-flight update one way or the other.
+//
+// The WHOLE verdict is serialised, not just the disarm below. Cancelling the
+// deadline narrows the race between a caller's Commit and the deadline
+// goroutine's Rollback but cannot close it: the timer may already be past its
+// select and inside Rollback by the time Commit cancels the context. Without
+// this lock both would clear the pendingAttestation gate and then act on
+// opposite verdicts - committing the journal and then restoring the old binary,
+// or recording succeeded and rolled_back for one command.
+//
+// The contended state is the FILESYSTEM, which the race detector cannot see, so
+// this has to be reasoned about rather than tested into existence. Whichever
+// verdict takes the lock first wins; the loser finds the update already decided
+// and returns the documented no-op.
 func (u *Updater) decide(ok bool, cause string) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
 	// Disarm the deadline first: whichever way this goes, the window is over,
 	// and a timer that fires afterwards would try to roll back an update that
 	// has already been committed.
-	u.mu.Lock()
 	if u.attestCancel != nil {
 		u.attestCancel()
 		u.attestCancel = nil
 	}
-	u.mu.Unlock()
 
 	j, pending := u.pendingAttestation()
 	if !pending {

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -133,17 +134,28 @@ func testUpdater(t *testing.T, apply ...func(*Config)) *Updater {
 
 // captureLog collects everything the Updater logs, so a test can assert on what
 // an operator would have been told.
+//
+// It is locked because a Logger genuinely is called from more than one
+// goroutine - the attestation deadline goroutine logs, and so does a Drain
+// callback that overran its timeout and was abandoned. Consumers face the same
+// requirement; this is the test suite holding itself to the contract it
+// documents.
 type captureLog struct {
+	mu    sync.Mutex
 	lines []string
 }
 
 func (c *captureLog) Logger() Logger {
 	return func(level Level, msg string, attrs ...any) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.lines = append(c.lines, level.String()+" "+msg)
 	}
 }
 
 func (c *captureLog) contains(substr string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, l := range c.lines {
 		if strings.Contains(l, substr) {
 			return true
