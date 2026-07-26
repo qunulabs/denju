@@ -8,6 +8,22 @@ major version is 0, the public API may change between minor releases.
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Added
+
+- `Updater.PendingAttestation` and the `Pending` type — report whether an update is
+  waiting for a verdict from this process, and what it was.
+
+  `Updater.Attest` remains the usual way to resolve one and needs no such check. This is
+  for a caller that judges health its own way — a registration accepted, a probe that has
+  to pass repeatedly, a real request served end to end — and therefore has to know whether
+  to begin that work at all. Without it the only options were to run the health policy on
+  every ordinary start, which is wasteful and surprising to whoever wrote the check, or to
+  give up a bespoke policy for the built-in deadline.
+
+  It is a query and changes nothing.
+
 ## [0.1.2]
 
 ### Fixed
@@ -74,7 +90,8 @@ First release.
 - `Logger` — a plain function type, with a `SlogLogger` adapter. Defaults to silence
   rather than to any global logger.
 
-[Unreleased]: https://github.com/qunulabs/denju/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/qunulabs/denju/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/qunulabs/denju/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/qunulabs/denju/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/qunulabs/denju/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/qunulabs/denju/releases/tag/v0.1.0

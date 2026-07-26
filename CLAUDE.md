@@ -41,7 +41,7 @@ state.go      the journal: state, paths, writeState/readState, goos + pidAlive s
 swap.go       preflightCheck, swapBinary, restoreOldBinary, copyBinary, sha256File
 restart.go    Restart, rollbackAndRestart, relaunchViaHelper, osExit seam
 repair.go     Repair and every branch it resolves
-attest.go     Attest, Commit, Rollback
+attest.go     Attest, PendingAttestation, Commit, Rollback
 record.go     Outcome, store, the cooldown anchor rule
 selftest.go   the selftest child protocol, tailBuffer
 helper.go     the Windows helper role, polling seams, platform seams
