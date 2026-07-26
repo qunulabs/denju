@@ -278,6 +278,97 @@ func TestRepair_DecidedOutcomeIsPreserved(t *testing.T) {
 	}
 }
 
+// A decided journal with no matching record is a dead end: PendingOutcome finds
+// nothing, so the outcome is never reported and the journal is never cleaned up.
+// It arises when the record has been removed or relocated, and for any program
+// whose PREVIOUS version updated itself by some other means and so kept no
+// record at all. Repair mints the missing record rather than leaving it lost.
+func TestRepair_DecidedJournalWithoutARecordIsRecorded(t *testing.T) {
+	cases := []struct {
+		phase string
+		cause string
+		want  Status
+	}{
+		{phaseCommitted, "", StatusSucceeded},
+		{phaseRolledBack, "the new version was no good", StatusRolledBack},
+	}
+	for _, tc := range cases {
+		t.Run(tc.phase, func(t *testing.T) {
+			f := newRepairFixture(t, "program", "1.0.0")
+			stageJournal(t, f.u, &state{
+				Phase: tc.phase, CommandID: "cmd-1",
+				OldVersion: "1.0.0", TargetVersion: "1.1.0",
+				ErrorMessage: tc.cause,
+			})
+
+			noErr(t, f.u.Repair(), "Repair")
+
+			got, err := f.u.PendingOutcome()
+			noErr(t, err, "PendingOutcome")
+			if got == nil {
+				t.Fatal("a decided update must leave a reportable outcome")
+			}
+			eq(t, got.Status, tc.want, "status")
+			eq(t, got.ID, "cmd-1", "id")
+			eq(t, got.ToVersion, "1.1.0", "to version")
+			eq(t, got.Error, tc.cause, "cause")
+
+			j, err := readState(f.p.State)
+			noErr(t, err, "readState")
+			eq(t, j.Phase, tc.phase, "the journal is left for the reporter")
+		})
+	}
+}
+
+// Repair runs on EVERY start, so the common case - a journal this same program
+// decided, whose record was written at the same moment - must not be rewritten.
+// Rewriting would push the cooldown anchor forward on every restart, turning one
+// finished update into an indefinite refusal of the next.
+func TestRepair_DecidedJournalDoesNotRewriteAnExistingRecord(t *testing.T) {
+	f := newRepairFixture(t, "program", "1.0.0")
+	stageJournal(t, f.u, &state{
+		Phase: phaseCommitted, CommandID: "cmd-1",
+		OldVersion: "1.0.0", TargetVersion: "1.1.0",
+	})
+
+	noErr(t, f.u.Repair(), "the first Repair")
+	first, err := f.u.PendingOutcome()
+	noErr(t, err, "PendingOutcome")
+	if first == nil {
+		t.Fatal("the first Repair must record the outcome")
+	}
+
+	for range 3 {
+		noErr(t, f.u.Repair(), "a later Repair")
+	}
+
+	again, err := f.u.PendingOutcome()
+	noErr(t, err, "PendingOutcome")
+	eq(t, again.At, first.At, "the outcome must not be rewritten")
+	eq(t, again.CooldownAt, first.CooldownAt, "the cooldown anchor must not move")
+}
+
+// An outcome already delivered must stay delivered. Repair sees the journal on
+// every start until the reporter cleans it up, and resurrecting a reported
+// outcome would report the same update again on each one.
+func TestRepair_DecidedJournalDoesNotResurrectAReportedOutcome(t *testing.T) {
+	f := newRepairFixture(t, "program", "1.0.0")
+	stageJournal(t, f.u, &state{
+		Phase: phaseCommitted, CommandID: "cmd-1",
+		OldVersion: "1.0.0", TargetVersion: "1.1.0",
+	})
+	noErr(t, f.u.Repair(), "Repair")
+	noErr(t, f.u.MarkReported(), "MarkReported")
+
+	noErr(t, f.u.Repair(), "the next start's Repair")
+
+	got, err := f.u.PendingOutcome()
+	noErr(t, err, "PendingOutcome")
+	if got != nil {
+		t.Fatalf("a reported outcome must not become pending again (got %+v)", got)
+	}
+}
+
 // An old journal in an unrecognized phase whose processes are gone is a crashed,
 // orphaned update: restore the old binary and garbage-collect.
 func TestRepair_StaleJournalRestoresAndCleansUp(t *testing.T) {
