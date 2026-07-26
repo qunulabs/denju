@@ -8,6 +8,24 @@ major version is 0, the public API may change between minor releases.
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+
+- `Commit` and the attestation deadline can no longer resolve one update two ways. The
+  verdict is now serialised end to end rather than only at the point the deadline is
+  disarmed, which left a window in which both took effect — producing a journal reading
+  `committed` over a binary that had been restored, or a single command recorded as both
+  `succeeded` and `rolled_back`.
+- A data race in the test suite, where the update rig shared an unsynchronised slice with
+  a drain callback that had overrun its timeout and been abandoned.
+
+### Changed
+
+- `Config.Log` is documented as requiring a `Logger` that is safe for concurrent use, and
+  `Config.Drain` as requiring a callback that stays safe after it overruns `DrainTimeout`
+  and is abandoned. Neither is a behaviour change; both were already true.
+
 ## [0.1.0]
 
 First release.
@@ -37,5 +55,6 @@ First release.
 - `Logger` — a plain function type, with a `SlogLogger` adapter. Defaults to silence
   rather than to any global logger.
 
-[Unreleased]: https://github.com/qunulabs/denju/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/qunulabs/denju/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/qunulabs/denju/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/qunulabs/denju/releases/tag/v0.1.0

@@ -2,6 +2,7 @@ package denju
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -196,6 +197,65 @@ func TestAttest_CommitDisarmsTheDeadline(t *testing.T) {
 	noErr(t, err, "readState")
 	eq(t, j.Phase, phaseCommitted, "phase")
 	eq(t, readFileString(t, f.bin), "new-binary", "the new binary stays")
+}
+
+// Commit and the deadline's Rollback must not both take effect. Disarming the
+// timer narrows that window but cannot close it: the timer goroutine may already
+// be past its select and inside Rollback when Commit cancels the context.
+//
+// The contended state is the filesystem, so the race detector is blind to this
+// and no interleaving can be forced deterministically. What the test can do is
+// collide the two repeatedly and assert the result is always SELF-CONSISTENT -
+// an update decided one way, with the binary, the rollback copy and the record
+// all agreeing. Unserialised, the losing outcome is a journal saying "committed"
+// over a binary that was restored, which is exactly what is checked here.
+func TestAttest_CommitRacingTheDeadlineDecidesOnlyOnce(t *testing.T) {
+	for i := range 40 {
+		t.Run(fmt.Sprintf("collision-%d", i), func(t *testing.T) {
+			f := newAttestFixture(t, phaseAttesting)
+
+			start := make(chan struct{})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				<-start
+				_ = f.u.Commit()
+			}()
+
+			// A deadline of zero fires immediately, so both verdicts are in
+			// flight at once.
+			f.u.Attest(context.Background(), 0)
+			close(start)
+			<-done
+
+			// Let a rollback that lost the lock finish attempting whatever it
+			// was going to attempt.
+			time.Sleep(20 * time.Millisecond)
+
+			j, err := readState(f.u.paths.State)
+			noErr(t, err, "readState")
+			rec, err := f.u.PendingOutcome()
+			noErr(t, err, "PendingOutcome")
+			if rec == nil {
+				t.Fatal("a decided update must always leave a record")
+			}
+
+			switch j.Phase {
+			case phaseCommitted:
+				eq(t, readFileString(t, f.bin), "new-binary",
+					"a committed update must not have had its binary restored")
+				isFalse(t, exists(f.u.paths.RollbackBinary),
+					"a commit releases the rollback copy")
+				eq(t, rec.Status, StatusSucceeded, "record status")
+			case phaseRolledBack:
+				eq(t, readFileString(t, f.bin), "old-binary",
+					"a rolled-back update must have had its binary restored")
+				eq(t, rec.Status, StatusRolledBack, "record status")
+			default:
+				t.Fatalf("the update was left undecided at phase %q", j.Phase)
+			}
+		})
+	}
 }
 
 // Cancelling the context disarms the window WITHOUT deciding. A program shutting

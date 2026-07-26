@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -47,9 +49,40 @@ type updateRig struct {
 	payload []byte
 	sha     string
 	src     *fakeSource
-	steps   *[]string
-	exits   *[]int
 	log     *captureLog
+
+	// A Drain callback that overruns DrainTimeout is abandoned but keeps
+	// running, so it records steps concurrently with the swap and the handoff
+	// on the main goroutine. That is the library behaving as designed - see
+	// Updater.drain - which makes the recorder itself the thing that has to be
+	// safe.
+	mu    sync.Mutex
+	steps []string
+	exits []int
+}
+
+func (r *updateRig) step(s string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.steps = append(r.steps, s)
+}
+
+func (r *updateRig) exit(code int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.exits = append(r.exits, code)
+}
+
+func (r *updateRig) stepsSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.steps)
+}
+
+func (r *updateRig) exitsSnapshot() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.exits)
 }
 
 func newUpdateRig(t *testing.T, apply ...func(*Config)) *updateRig {
@@ -60,19 +93,23 @@ func newUpdateRig(t *testing.T, apply ...func(*Config)) *updateRig {
 	writeBinary(t, bin, "current")
 
 	payload := []byte("this is the new program binary")
-	steps := &[]string{}
-	exits := &[]int{}
 	log := &captureLog{}
+	rig := &updateRig{
+		bin: bin, dir: dir,
+		payload: payload, sha: sha256Hex(payload),
+		src: &fakeSource{payload: payload},
+		log: log,
+	}
 
 	prevExec := execSelf
 	execSelf = func(string, []string, []string) error {
-		*steps = append(*steps, "exec")
+		rig.step("exec")
 		return nil
 	}
 	t.Cleanup(func() { execSelf = prevExec })
 
 	prevExit := osExit
-	osExit = func(code int) { *exits = append(*exits, code) }
+	osExit = func(code int) { rig.exit(code) }
 	t.Cleanup(func() { osExit = prevExit })
 
 	prevIdentity := serviceIdentity
@@ -93,16 +130,12 @@ func newUpdateRig(t *testing.T, apply ...func(*Config)) *updateRig {
 	noErr(t, err, "New")
 
 	u.runSelftest = func(string, []string, string) error {
-		*steps = append(*steps, "selftest")
+		rig.step("selftest")
 		return nil
 	}
 
-	return &updateRig{
-		u: u, bin: bin, dir: dir,
-		payload: payload, sha: sha256Hex(payload),
-		src:   &fakeSource{payload: payload},
-		steps: steps, exits: exits, log: log,
-	}
+	rig.u = u
+	return rig
 }
 
 // req builds the request this rig's source satisfies.
@@ -303,15 +336,16 @@ func TestUpdate_BeforeHandoffRunsAfterTheSwapAndBeforeTheExec(t *testing.T) {
 		c.BeforeHandoff = func() {}
 	})
 	r.u.cfg.BeforeHandoff = func() {
-		*r.steps = append(*r.steps, "handoff")
+		r.step("handoff")
 		contentAtHandoff = r.binaryContent(t)
 	}
 
 	eq(t, r.u.Update(context.Background(), r.req(), r.src).Status, StatusSucceeded, "status")
-	eq(t, len(*r.steps), 3, "steps")
-	eq(t, (*r.steps)[0], "selftest", "steps[0]")
-	eq(t, (*r.steps)[1], "handoff", "steps[1]")
-	eq(t, (*r.steps)[2], "exec", "steps[2]")
+	steps := r.stepsSnapshot()
+	eq(t, len(steps), 3, "steps")
+	eq(t, steps[0], "selftest", "steps[0]")
+	eq(t, steps[1], "handoff", "steps[1]")
+	eq(t, steps[2], "exec", "steps[2]")
 	eq(t, contentAtHandoff, string(r.payload), "the new binary must already be installed")
 }
 
@@ -354,7 +388,7 @@ func TestUpdate_DrainErrorAbortsTheUpdate(t *testing.T) {
 	var r *updateRig
 	r = newUpdateRig(t, func(c *Config) {
 		c.Drain = func(context.Context) error {
-			*r.steps = append(*r.steps, "drain")
+			r.step("drain")
 			return errors.New("a job refused to stop")
 		}
 	})
@@ -365,9 +399,10 @@ func TestUpdate_DrainErrorAbortsTheUpdate(t *testing.T) {
 	hasSubstr(t, got.Error, "prepare-for-update failed", "error")
 	hasSubstr(t, got.Error, "a job refused to stop", "error")
 
-	eq(t, len(*r.steps), 2, "steps")
-	eq(t, (*r.steps)[0], "selftest", "steps[0]")
-	eq(t, (*r.steps)[1], "drain", "steps[1]")
+	steps := r.stepsSnapshot()
+	eq(t, len(steps), 2, "steps")
+	eq(t, steps[0], "selftest", "steps[0]")
+	eq(t, steps[1], "drain", "steps[1]")
 	eq(t, r.binaryContent(t), "current", "the binary must be untouched")
 	eq(t, r.extraFiles(t), 0, "an aborted update has to be indistinguishable from no update")
 }
@@ -385,7 +420,7 @@ func TestUpdate_DrainTimeoutProceedsAnyway(t *testing.T) {
 	r = newUpdateRig(t, func(c *Config) {
 		c.DrainTimeout = 50 * time.Millisecond
 		c.Drain = func(ctx context.Context) error {
-			*r.steps = append(*r.steps, "drain")
+			r.step("drain")
 			<-ctx.Done() // never finishes on its own
 			close(drainReturned)
 			return ctx.Err()
@@ -395,8 +430,9 @@ func TestUpdate_DrainTimeoutProceedsAnyway(t *testing.T) {
 	got := r.u.Update(context.Background(), r.req(), r.src)
 
 	eq(t, got.Status, StatusSucceeded, "status")
-	eq(t, len(*r.steps), 3, "an overrunning drain must be abandoned, not allowed to block the swap")
-	eq(t, (*r.steps)[2], "exec", "steps[2]")
+	steps := r.stepsSnapshot()
+	eq(t, len(steps), 3, "an overrunning drain must be abandoned, not allowed to block the swap")
+	eq(t, steps[2], "exec", "steps[2]")
 	eq(t, r.binaryContent(t), string(r.payload), "the new binary must have been swapped in")
 
 	// The callback's own error, arriving after the deadline, must be ignored
@@ -421,7 +457,7 @@ func TestUpdate_DrainRunsAfterSelftestAndBeforeTheSwap(t *testing.T) {
 	var r *updateRig
 	r = newUpdateRig(t, func(c *Config) {
 		c.Drain = func(context.Context) error {
-			*r.steps = append(*r.steps, "drain")
+			r.step("drain")
 			atDrain = r.binaryContent(t)
 			rollbackExisted = exists(r.u.paths.RollbackBinary)
 			return nil
@@ -430,10 +466,11 @@ func TestUpdate_DrainRunsAfterSelftestAndBeforeTheSwap(t *testing.T) {
 
 	eq(t, r.u.Update(context.Background(), r.req(), r.src).Status, StatusSucceeded, "status")
 
-	eq(t, len(*r.steps), 3, "steps")
-	eq(t, (*r.steps)[0], "selftest", "steps[0]")
-	eq(t, (*r.steps)[1], "drain", "steps[1]")
-	eq(t, (*r.steps)[2], "exec", "steps[2]")
+	steps := r.stepsSnapshot()
+	eq(t, len(steps), 3, "steps")
+	eq(t, steps[0], "selftest", "steps[0]")
+	eq(t, steps[1], "drain", "steps[1]")
+	eq(t, steps[2], "exec", "steps[2]")
 	eq(t, atDrain, "current", "the binary must still be the old one while the program is draining")
 	isFalse(t, rollbackExisted, "nothing may be linked aside before the drain has finished")
 	eq(t, r.binaryContent(t), string(r.payload), "the new binary is installed afterwards")
@@ -542,8 +579,9 @@ func TestUpdate_WindowsHandoffExitsZero(t *testing.T) {
 
 	got := r.u.Update(context.Background(), r.req(), r.src)
 	eq(t, got.Status, StatusSucceeded, "status")
-	eq(t, len(*r.exits), 1, "the process must exit for the helper to take over")
-	eq(t, (*r.exits)[0], 0, "exit code")
+	exits := r.exitsSnapshot()
+	eq(t, len(exits), 1, "the process must exit for the helper to take over")
+	eq(t, exits[0], 0, "exit code")
 
 	eq(t, len(seams.spawns), 1, "the helper must be spawned")
 	eq(t, seams.spawns[0].path, r.u.paths.HelperCopy, "the helper is a copy of the binary")
@@ -566,7 +604,7 @@ func TestUpdate_WindowsHandshakeTimeoutAborts(t *testing.T) {
 	got := r.u.Update(context.Background(), r.req(), r.src)
 	eq(t, got.Status, StatusFailed, "status")
 	hasSubstr(t, got.Error, "did not start", "error")
-	eq(t, len(*r.exits), 0, "the program must keep running")
+	eq(t, len(r.exitsSnapshot()), 0, "the program must keep running")
 	eq(t, r.binaryContent(t), "current", "the binary is untouched")
 	eq(t, r.extraFiles(t), 0, "an aborted handoff cleans up after itself")
 }
@@ -602,7 +640,7 @@ func TestUpdate_WindowsDrainErrorAbortsAndCleansUp(t *testing.T) {
 	got := r.u.Update(context.Background(), r.req(), r.src)
 	eq(t, got.Status, StatusFailed, "status")
 	hasSubstr(t, got.Error, "could not quiesce", "error")
-	eq(t, len(*r.exits), 0, "the program must keep running")
+	eq(t, len(r.exitsSnapshot()), 0, "the program must keep running")
 	eq(t, r.extraFiles(t), 0, "the journal, helper copy and staged download are all reclaimed")
 }
 

@@ -128,7 +128,24 @@ it.
 string. When `TargetVersion == OldVersion`, `selfIsNewVersion` compares the running
 binary's digest against `new_sha256` instead.
 
-**15. The Windows handshake precedes the drain.** The helper is spawned and has proved it
+**15. A verdict is serialised end to end.** `decide` holds `u.mu` across the *whole*
+resolution, not just the timer disarm. Disarming narrows the race between a caller's
+`Commit` and the deadline goroutine's `Rollback` but cannot close it — the timer may
+already be past its select and inside `Rollback`. Unserialised, both clear the
+`pendingAttestation` gate and act on opposite verdicts: a journal reading `committed` over
+a binary that was restored, or one command recorded as both `succeeded` and `rolled_back`.
+The contended state is the *filesystem*, so `-race` is blind to it and only
+`TestAttest_CommitRacingTheDeadlineDecidesOnlyOnce` catches it — reproducibly, at roughly
+one collision in ten.
+
+**16. An abandoned drain is concurrent with everything after it.** Invariant 5 means a
+callback that overruns is left running, so from that moment it races the swap, the
+`BeforeHandoff` callback and the handover. That is the caller's problem to handle and is
+documented on `Config.Drain`, but it is also *denju's* problem in tests: it is why the
+update rig's step recorder and `captureLog` are both locked, and why `Config.Log` is
+specified as safe for concurrent use.
+
+**17. The Windows handshake precedes the drain.** The helper is spawned and has proved it
 started *before* the program stops serving, so a helper that cannot start aborts the
 update at no cost. This is the opposite order from Unix, on purpose.
 
@@ -173,7 +190,15 @@ the shapes are frozen for every namespace equally.
 ## Testing
 
 `go test ./...`. No test dependencies — stdlib `testing` only, with small assertion
-helpers in `helpers_test.go`. `TestNoTestDependencies` keeps it that way: a library a
+helpers in `helpers_test.go`.
+
+**`-race` is not optional, and CI is the only place it runs.** It needs cgo, which the
+Windows development machine has no C toolchain for, so `go test -race` fails locally before
+it starts. A red race job is therefore a real defect that was never going to be caught
+before the push — never a flake, and never something to re-run until it passes. It has
+already caught one: the update rig shared a bare slice with an abandoned drain goroutine,
+and it failed on Go 1.26 while passing on 1.24, which is scheduling luck rather than
+evidence. `TestNoTestDependencies` keeps it that way: a library a
 program depends on for its ability to start at all should not pull an assertion framework
 into everybody's build.
 

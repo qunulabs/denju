@@ -46,6 +46,11 @@ type Config struct {
 	RecordPath string
 
 	// Log receives everything denju has to say. nil means silence.
+	//
+	// It must be safe for concurrent use: denju logs from the attestation
+	// deadline goroutine and from an abandoned Drain as well as from the
+	// caller's own goroutine. [SlogLogger] already is; a closure appending to a
+	// bare slice is not.
 	Log Logger
 
 	// Selftest runs in the freshly downloaded binary, as a child process, before
@@ -68,6 +73,13 @@ type Config struct {
 	// An error aborts the update. A timeout does NOT: a program wedged in its
 	// own drain must still be able to receive a fix, and the alternative is a
 	// host pinned on a broken version until a human intervenes.
+	//
+	// That has a consequence worth designing for. A callback that overruns
+	// DrainTimeout is abandoned, not stopped - it keeps running, and from that
+	// moment it is CONCURRENT with the swap, with BeforeHandoff, and with the
+	// handover itself. So it has to be safe to run alongside them: treat ctx
+	// being cancelled as the signal to stop touching shared state, and do not
+	// assume the program still owns the binary that is on disk.
 	Drain func(context.Context) error
 
 	// BeforeHandoff is called after the binary has been swapped, immediately
