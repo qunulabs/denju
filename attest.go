@@ -58,6 +58,49 @@ func (u *Updater) Attest(ctx context.Context, d time.Duration) {
 	}()
 }
 
+// Pending describes an update that has been installed but not yet judged: this
+// process is running the new version, and nothing has committed or rolled it
+// back. Returned by [Updater.PendingAttestation].
+type Pending struct {
+	// ID echoes [Request.ID], so a verdict can be tied back to what asked for
+	// the update.
+	ID string
+	// FromVersion and ToVersion describe the move that was made.
+	FromVersion string
+	ToVersion   string
+}
+
+// PendingAttestation reports whether an update is waiting for a verdict from
+// THIS process, and what it was.
+//
+// [Updater.Attest] is the usual way to resolve one and needs no such check: it
+// arms a deadline and rolls back if nothing decides in time, doing nothing at
+// all when no update is in flight. This is for a caller that would rather judge
+// health its own way — a registration accepted, a probe that has to pass several
+// times, a real request served end to end — and so needs to know whether to
+// start that work at all.
+//
+// The distinction matters because health checks are rarely free. Running one on
+// every ordinary start, just in case this start happens to follow an update, is
+// both wasteful and a surprise to whoever wrote the check.
+//
+// It is a query and changes nothing. False means there is no journal, the update
+// has already been decided, or this process is the OLD version rather than the
+// new one — an old image reaching here has already been handled by
+// [Updater.Repair], and letting it attest would confirm an update that never
+// took effect.
+func (u *Updater) PendingAttestation() (Pending, bool) {
+	j, ok := u.pendingAttestation()
+	if !ok {
+		return Pending{}, false
+	}
+	return Pending{
+		ID:          j.CommandID,
+		FromVersion: j.OldVersion,
+		ToVersion:   j.TargetVersion,
+	}, true
+}
+
 // Commit accepts the update this process is the result of. The rollback copy of
 // the previous binary is released and the outcome is recorded as succeeded,
 // ready for [Updater.PendingOutcome] to report.

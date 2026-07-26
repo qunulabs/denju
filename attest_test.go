@@ -199,6 +199,56 @@ func TestAttest_CommitDisarmsTheDeadline(t *testing.T) {
 	eq(t, readFileString(t, f.bin), "new-binary", "the new binary stays")
 }
 
+// A caller with its own health policy needs to know whether to run it at all.
+// Health checks cost something, and running one on every ordinary start just in
+// case would be both wasteful and a surprise to whoever wrote it.
+func TestPendingAttestation(t *testing.T) {
+	for _, phase := range []string{phaseSwapped, phaseAttesting} {
+		t.Run(phase, func(t *testing.T) {
+			f := newAttestFixture(t, phase)
+
+			got, ok := f.u.PendingAttestation()
+			isTrue(t, ok, "an installed but unjudged update is pending")
+			eq(t, got.ID, "cmd-1", "id")
+			eq(t, got.FromVersion, "1.4.0", "from version")
+			eq(t, got.ToVersion, "1.5.0", "to version")
+
+			// A query changes nothing: asking twice gives the same answer, and
+			// the journal is untouched.
+			_, again := f.u.PendingAttestation()
+			isTrue(t, again, "the query must not consume the pending update")
+			j, err := readState(f.u.paths.State)
+			noErr(t, err, "readState")
+			eq(t, j.Phase, phase, "phase untouched")
+		})
+	}
+}
+
+func TestPendingAttestation_NothingInFlight(t *testing.T) {
+	u := testUpdater(t)
+	_, ok := u.PendingAttestation()
+	isFalse(t, ok, "no journal means nothing to attest")
+}
+
+func TestPendingAttestation_AlreadyDecided(t *testing.T) {
+	for _, phase := range []string{phaseCommitted, phaseRolledBack} {
+		f := newAttestFixture(t, phase)
+		_, ok := f.u.PendingAttestation()
+		isFalse(t, ok, "a decided update is not awaiting a verdict")
+	}
+}
+
+// The OLD image must never be told an update is awaiting its verdict. Repair has
+// already dealt with it, and attesting from here would confirm an update that
+// never took effect.
+func TestPendingAttestation_RefusedFromTheOldImage(t *testing.T) {
+	f := newAttestFixture(t, phaseAttesting)
+	f.u.cfg.Version = "1.4.0" // the OLD version, not the journal's target
+
+	_, ok := f.u.PendingAttestation()
+	isFalse(t, ok, "the old image has nothing to attest")
+}
+
 // Commit and the deadline's Rollback must not both take effect. Disarming the
 // timer narrows that window but cannot close it: the timer goroutine may already
 // be past its select and inside Rollback when Commit cancels the context.
