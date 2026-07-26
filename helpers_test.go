@@ -53,13 +53,6 @@ func eq[T comparable](t *testing.T, got, want T, what string) {
 	}
 }
 
-func neq[T comparable](t *testing.T, got, unwanted T, what string) {
-	t.Helper()
-	if got == unwanted {
-		t.Errorf("%s = %v, want anything else", what, got)
-	}
-}
-
 func isTrue(t *testing.T, got bool, what string) {
 	t.Helper()
 	if !got {

@@ -183,22 +183,6 @@ three in the morning, and `<binary>.old` is the name they will guess.
 
 ---
 
-## Provenance
-
-denju was extracted from two closed-source programs. `TestNoProvenanceLeaks` scans every
-`.go`, `.md` and workflow file for terms that would name them, and fails on the machine
-where the mistake is made rather than in a pull request two minutes later.
-
-If you port more code in from either origin, **rewrite the comments** rather than copying
-them. Several described a specific product's architecture in prose that reads as generic
-until you notice it is describing a load balancer nobody here has. Every occurrence of
-"agent" becomes "program"; "the backend" becomes "the caller".
-
-The naming-contract test uses *invented* namespaces, not the real ones. It loses nothing:
-the shapes are frozen for every namespace equally.
-
----
-
 ## Testing
 
 `go test ./...`. No test dependencies — stdlib `testing` only, with small assertion

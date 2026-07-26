@@ -110,8 +110,8 @@ func TestDefaultPIDAlive(t *testing.T) {
 // changeover - the successor sees a journal it cannot make sense of, and
 // resolves an update that actually succeeded as an interrupted one.
 //
-// The fixture below is a journal as produced by the implementations denju was
-// extracted from. It must keep parsing, field for field, forever.
+// The fixture below is a journal as produced by an earlier release of denju.
+// It must keep parsing, field for field, forever.
 func TestJournalWireCompatibility(t *testing.T) {
 	const fixture = `{
   "command_id": "d3b0c442-98fc-4e1b-9a2f-000000000001",
