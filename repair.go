@@ -50,13 +50,42 @@ func (u *Updater) Repair() error {
 			return u.repairNewImage(j)
 		}
 		return u.repairInterruptedOldImage(j)
-	case phaseRolledBack, phaseCommitted:
-		// A decided outcome: leave it for the reporter, which delivers it and
-		// only then cleans up.
-		return nil
+	case phaseCommitted:
+		return u.repairDecided(j, StatusSucceeded, "")
+	case phaseRolledBack:
+		return u.repairDecided(j, StatusRolledBack, j.ErrorMessage)
 	default:
 		return u.repairStale(j)
 	}
+}
+
+// repairDecided handles a journal that already carries a verdict. The files are
+// settled, so there is nothing to reconcile on disk and the journal is left for
+// the reporter, which delivers the outcome and only then cleans up.
+//
+// The one thing it does is make sure the outcome was actually RECORDED. Whatever
+// decided the update normally writes the record itself, and recordRepairOutcome
+// leaves that record alone - so on the overwhelmingly common path this call does
+// nothing at all. It matters when the two have come apart:
+//
+//   - The record was removed or is being looked for somewhere else - a state
+//     directory cleaned between runs, or a Config.RecordPath that moved.
+//   - The journal was written by an earlier version of the program whose update
+//     mechanism was not denju, and which therefore kept no record. A program
+//     adopting denju hits this on exactly the update that installs the adopting
+//     build, which is the worst possible one to lose: the whole fleet reports
+//     nothing for the rollout itself.
+//
+// Without this, a decided journal with no record is a dead end. PendingOutcome
+// returns nothing, so the outcome is never reported and the journal is never
+// cleaned up, leaving it and the rollback copy on disk for good.
+//
+// The status must match what the deciding path records for the same phase, or
+// the idempotence guard stops matching and every start rewrites the record,
+// pushing the cooldown anchor forward forever.
+func (u *Updater) repairDecided(j *state, status Status, cause string) error {
+	u.recordRepairOutcome(j, status, cause)
+	return nil
 }
 
 // repairStagedHandoff resolves a journal stuck at phaseStaged - a Windows

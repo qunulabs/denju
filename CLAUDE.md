@@ -92,12 +92,24 @@ recoverable; an update that can never be applied needs a human on the host.
 **6. Repair runs before any lock or port.** A crash-loop rollback restarts the process,
 and the successor needs whatever this one holds.
 
-**7. Repair must RECORD what it concludes.** Rolling back is half the job. The record is
-the cooldown's only anchor and the only input a report has, and the process that started
-the update is gone, so nothing else can write it. Observed live without it: the restored
-old version came up, found no record, accepted the same broken binary again, and looped —
-five rollbacks and six swaps in forty seconds, each a full download, with the control
-plane never told a thing.
+**7. Repair must RECORD what it concludes — including a verdict it merely finds.** Rolling
+back is half the job. The record is the cooldown's only anchor and the only input a report
+has, and the process that started the update is gone, so nothing else can write it.
+Observed live without it: the restored old version came up, found no record, accepted the
+same broken binary again, and looped — five rollbacks and six swaps in forty seconds, each
+a full download, with the control plane never told a thing.
+
+This extends to a journal that is *already* decided (`repairDecided`). Normally the path
+that decided it wrote the record at the same moment, so that call does nothing. It matters
+when journal and record have come apart: a record removed or relocated, or — the case every
+adopting program hits exactly once — a journal written by a previous version whose update
+mechanism was not denju and which kept no record. A decided journal with no record is a
+dead end: `PendingOutcome` returns nothing, so the outcome is never reported and the
+journal and rollback copy are never cleaned up.
+
+The status must match what the deciding path writes for that phase (`committed` →
+`StatusSucceeded`, `rolledback` → `StatusRolledBack`). Diverge and invariant 8's guard
+stops matching, which turns "record it once" into "rewrite it on every start".
 
 **8. Repair must not RE-record an outcome it already recorded.** It runs on every start,
 and each rewrite would push the cooldown anchor forward, turning one failed update into

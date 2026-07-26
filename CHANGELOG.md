@@ -8,6 +8,25 @@ major version is 0, the public API may change between minor releases.
 
 ## [Unreleased]
 
+## [0.1.2]
+
+### Fixed
+
+- `Updater.Repair` now records an outcome for a journal that already carries a verdict but
+  has no matching record, instead of leaving it unreported. Such a journal was a dead end:
+  `PendingOutcome` returned nothing, so the outcome was never delivered and neither the
+  journal nor the rollback copy was ever cleaned up.
+
+  It arises whenever the record and the journal come apart — a record removed or a
+  `Config.RecordPath` that moved — and, once, for every program adopting denju in place of
+  an update mechanism of its own: the journal describing the update that installs the
+  adopting build was written by a version that kept no record, so that update went
+  unreported on every host.
+
+  An outcome that was already recorded is left untouched, so the ordinary path, where the
+  deciding code wrote the record itself, is unaffected and the cooldown anchor does not
+  move.
+
 ## [0.1.1]
 
 ### Fixed
@@ -55,6 +74,7 @@ First release.
 - `Logger` — a plain function type, with a `SlogLogger` adapter. Defaults to silence
   rather than to any global logger.
 
-[Unreleased]: https://github.com/qunulabs/denju/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/qunulabs/denju/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/qunulabs/denju/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/qunulabs/denju/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/qunulabs/denju/releases/tag/v0.1.0
