@@ -163,8 +163,12 @@ func (u *Updater) swapAndExec(j *state, stagedPath string) Result {
 		j.Phase = phaseRolledBack
 		j.ErrorMessage = "exec failed: " + err.Error()
 		if renErr := os.Rename(u.paths.RollbackBinary, u.binaryPath); renErr != nil {
+			// Stuck between the two: the new binary is on disk, this process is
+			// still the old image, and everything the program shut down in order to
+			// hand over is staying shut down. The journal is left alone so the next
+			// start can reconcile what is actually there.
 			u.log(LevelError, "CRITICAL: could not restore the old binary after a failed exec", "err", renErr)
-			return u.failJournal(j, "exec failed and the old binary could not be restored: "+renErr.Error())
+			return u.abandon(j, StatusFailed, "exec failed and the old binary could not be restored: "+renErr.Error())
 		}
 		if wErr := writeState(u.n, u.paths.State, j); wErr != nil {
 			u.log(LevelError, "could not journal the rollback", "err", wErr)
@@ -172,9 +176,13 @@ func (u *Updater) swapAndExec(j *state, stagedPath string) Result {
 		if execErr := execSelf(u.binaryPath, os.Args, os.Environ()); execErr != nil {
 			u.log(LevelError, "CRITICAL: could not exec the restored old binary", "err", execErr)
 		}
-		return u.record(Request{ID: j.CommandID, TargetVersion: j.TargetVersion}, StatusRolledBack, j.ErrorMessage)
+		// The rollback itself worked, so the binary on disk is sound - but this
+		// process is still the drained, handed-over image it turned into, and a
+		// successful exec would not have come back here at all.
+		return u.abandon(j, StatusRolledBack, j.ErrorMessage)
 	}
-	// Unreachable: a successful exec never returns.
+	// Unreachable: a successful exec never returns. Reached only through the test
+	// seam, and not intact even so - everything past beforeHandoff is.
 	return Result{Status: StatusSucceeded}
 }
 
@@ -224,7 +232,12 @@ func (u *Updater) windowsHandoff(j *state, stagedPath string) Result {
 	if !u.waitForHandshake(p.State) {
 		_ = killPID(helperPID)
 		u.abortHandoff(p, stagedPath)
-		return u.failJournal(j, "the update helper did not start within "+u.cfg.HandshakeTimeout.String())
+		// The reason is almost always the same one, and it is not guessable from
+		// the symptom: the helper is a copy of the program running the program's
+		// own main, so it only ever reaches its updater role if RunProcessRole is
+		// called early enough. Say so, or every occurrence starts from scratch.
+		return u.failJournal(j, "the update helper did not start within "+u.cfg.HandshakeTimeout.String()+
+			" - Updater.RunProcessRole must be called at the very top of main, before flags, config or anything that can block")
 	}
 
 	if err := u.drain(); err != nil {
@@ -240,7 +253,8 @@ func (u *Updater) windowsHandoff(j *state, stagedPath string) Result {
 	u.beforeHandoff()
 
 	osExit(0)
-	// Unreachable in production; reached only through the test exit seam.
+	// Unreachable in production; reached only through the test exit seam. Not
+	// intact even so - beforeHandoff has already run.
 	return Result{Status: StatusSucceeded}
 }
 
@@ -334,10 +348,35 @@ func (u *Updater) failJournal(j *state, msg string) Result {
 // store owns the cooldown-anchor rule, so a refusal recorded here leaves the
 // cooldown exactly where the last completed update put it.
 //
+// Everything that reaches here left the program able to carry on, so the Result
+// says so. The paths that did not go through abandon instead.
+//
 // A request with no ID records nothing: there is nobody to report to.
 func (u *Updater) record(req Request, status Status, msg string) Result {
+	return u.recordWith(req, status, msg, true)
+}
+
+// abandon records the outcome of an update that got PAST the point of no return
+// and marks the Result so the caller stops rather than carries on.
+//
+// It does not log: the two situations that reach it need different words, and a
+// generic line here would either duplicate or contradict the specific one the
+// caller already wrote.
+//
+// The journal is deliberately LEFT IN PLACE, which is the whole difference from
+// failJournal. An ordinary refusal deletes it because an untouched program has
+// nothing to reconcile. Here the process no longer matches the binary beside it,
+// and the journal is the only thing that lets the next start work out which of
+// the two it is looking at. Deleting it would destroy the evidence and strand
+// the machine.
+func (u *Updater) abandon(j *state, status Status, msg string) Result {
+	return u.recordWith(Request{ID: j.CommandID, TargetVersion: j.TargetVersion}, status, msg, false)
+}
+
+func (u *Updater) recordWith(req Request, status Status, msg string, intact bool) Result {
+	res := Result{Status: status, Error: msg, ProgramIntact: intact}
 	if req.ID == "" {
-		return Result{Status: status, Error: msg}
+		return res
 	}
 	o := &Outcome{
 		At:          time.Now(),
@@ -350,5 +389,5 @@ func (u *Updater) record(req Request, status Status, msg string) Result {
 	if err := u.records.record(o); err != nil {
 		u.log(LevelError, "could not write the update record", "err", err)
 	}
-	return Result{Status: status, Error: msg}
+	return res
 }

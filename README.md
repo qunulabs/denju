@@ -99,6 +99,26 @@ res := u.Update(ctx, denju.Request{
 replaced, and on Windows the process has exited so a helper can take over. A returned
 `Result` always describes an update that did not happen.
 
+Not all of those are survivable, and `Status` cannot tell them apart — a refused
+download and a failed exec whose rollback *also* failed are both `StatusFailed`.
+`ProgramIntact` is what separates them:
+
+```go
+res := u.Update(ctx, req, src)
+if !res.ProgramIntact {
+    // The drain has run, BeforeHandoff has fired, and the binary on disk is no
+    // longer this process. Carrying on means running a program that has already
+    // shut down.
+    log.Error("the update could neither be completed nor undone", "err", res.Error)
+    os.Exit(1)
+}
+log.Warn("update refused", "err", res.Error)
+```
+
+It takes an exec failure *and* a failed restore of the previous binary in the same
+attempt, so it is rare — and it is the one outcome that must not be logged and
+shrugged off. The journal is left on disk so the next start can reconcile it.
+
 Once healthy, accept it:
 
 ```go

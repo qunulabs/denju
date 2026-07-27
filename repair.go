@@ -47,6 +47,9 @@ func (u *Updater) Repair() error {
 		return u.repairStagedHandoff(j)
 	case phaseSwapped, phaseAttesting:
 		if u.selfIsNewVersion(j) {
+			if u.outcomeRecorded(j, StatusSucceeded) {
+				return u.reconcileCommitted(j)
+			}
 			return u.repairNewImage(j)
 		}
 		return u.repairInterruptedOldImage(j)
@@ -116,6 +119,45 @@ func (u *Updater) repairStagedHandoff(j *state) error {
 	return nil
 }
 
+// outcomeRecorded reports whether the durable record already carries the given
+// status for the update this journal describes.
+func (u *Updater) outcomeRecorded(j *state, status Status) bool {
+	if j.CommandID == "" {
+		return false
+	}
+	prev, err := u.records.load()
+	if err != nil {
+		u.log(LevelError, "could not read the update record", "err", err)
+		return false
+	}
+	return prev != nil && prev.ID == j.CommandID && prev.Status == status
+}
+
+// reconcileCommitted finishes a commit whose journal write did not land.
+//
+// The record is the verdict and the journal only follows it, so when the two
+// disagree this way - record says succeeded, journal still says attesting - the
+// update WAS accepted, by a process that then could not write the phase or died
+// between the two writes. Without this the crash counter would climb on every
+// start and eventually roll back a version that attested healthy.
+//
+// A journal that still cannot be written is logged and left. The point of this
+// path is to stop the rollback, and that has already been achieved by getting
+// here; failing startup over an unwritable file would take a healthy program
+// down for bookkeeping.
+func (u *Updater) reconcileCommitted(j *state) error {
+	u.log(LevelWarn, "the journal does not record the commit that the outcome record does; reconciling",
+		"target_version", j.TargetVersion,
+		"phase", j.Phase)
+	j.Phase = phaseCommitted
+	if err := writeState(u.n, u.paths.State, j); err != nil {
+		u.log(LevelError, "could not reconcile the committed journal", "err", err)
+		return nil
+	}
+	_ = os.Remove(u.paths.RollbackBinary)
+	return nil
+}
+
 // repairNewImage handles startup as the freshly-swapped new image while the
 // update is still uncommitted. It refreshes the journal's PID and increments the
 // crash counter; once the count exceeds the tolerance it rolls back to the
@@ -139,7 +181,11 @@ func (u *Updater) repairNewImage(j *state) error {
 	// Recorded BEFORE the rollback, because a successful rollback restarts the
 	// process and never comes back here.
 	u.recordRepairOutcome(j, StatusRolledBack, cause)
-	return u.rollbackAndRestart(j, cause)
+	if err := u.rollbackAndRestart(j, cause); err != nil {
+		u.correctFailedRollback(j, err)
+		return err
+	}
+	return nil
 }
 
 // repairInterruptedOldImage handles startup as the OLD image while the journal
@@ -188,6 +234,39 @@ func (u *Updater) recordRepairOutcome(j *state, status Status, cause string) {
 		ToVersion:   j.TargetVersion,
 		Status:      status,
 		Error:       cause,
+	}); err != nil {
+		u.log(LevelError, "could not write the update record", "err", err)
+	}
+}
+
+// correctFailedRollback rewrites a rolled_back record once the rollback it
+// describes turns out not to have happened.
+//
+// A rollback is recorded before it is attempted, because a successful one
+// restarts the process and never comes back to record anything. That ordering is
+// right and leaves exactly one thing to repair: when the restore fails, the
+// record - and therefore the report - says the machine went back to the old
+// version while it is in fact still running the new one. An operator chasing a
+// bad rollout would be looking at the wrong host.
+//
+// It writes through the store directly rather than through recordRepairOutcome,
+// whose idempotence guard exists to stop repeated starts pushing the cooldown
+// anchor forward and would read this correction as a duplicate and drop it.
+func (u *Updater) correctFailedRollback(j *state, cause error) {
+	u.log(LevelError, "CRITICAL: the rollback was recorded but could not be carried out",
+		"target_version", j.TargetVersion,
+		"old_version", j.OldVersion,
+		"err", cause)
+	if j.CommandID == "" {
+		return
+	}
+	if err := u.records.record(&Outcome{
+		At:          time.Now(),
+		ID:          j.CommandID,
+		FromVersion: j.OldVersion,
+		ToVersion:   j.TargetVersion,
+		Status:      StatusFailed,
+		Error:       "rollback failed: " + cause.Error(),
 	}); err != nil {
 		u.log(LevelError, "could not write the update record", "err", err)
 	}

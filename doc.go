@@ -81,6 +81,25 @@
 // over. A returned [Result] therefore always describes an update that did not
 // happen.
 //
+// Not all of those are survivable, and [Result.Status] cannot tell them apart -
+// a refused download and a failed exec whose rollback ALSO failed are both
+// StatusFailed. [Result.ProgramIntact] is what separates them:
+//
+//	res := u.Update(ctx, req, src)
+//	if !res.ProgramIntact {
+//		// The drain has run, BeforeHandoff has fired, and the binary on disk is
+//		// no longer this process. Carrying on means running a program that has
+//		// already shut down.
+//		log.Error("the update could neither be completed nor undone", "err", res.Error)
+//		os.Exit(1)
+//	}
+//	log.Warn("update refused", "err", res.Error)
+//
+// It is rare - it takes an exec failure and a failed restore of the previous
+// binary in the same attempt - and it is the one outcome that must not be logged
+// and shrugged off. The journal is deliberately left on disk so the next start
+// can reconcile what is actually there.
+//
 // # Integrity
 //
 // denju verifies the SHA-256 that the caller passes in [Request.SHA256] against

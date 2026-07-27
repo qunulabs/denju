@@ -84,6 +84,14 @@ func (u *Updater) rollbackAndRestart(j *state, cause string) error {
 // exists, write the journal the helper will read, spawn the helper detached in
 // relaunch mode, and exit so the helper's wait can complete. Never returns on
 // success.
+//
+// The exit code is ZERO, including on the rollback path where the restart is the
+// consequence of something having gone wrong. Under the service control manager
+// a non-zero exit fires the service's configured recovery action, which would
+// race the helper's own StartService for the same service - two restarts, one of
+// which must lose. Zero reads as a deliberate stop and leaves the helper in sole
+// control of bringing the program back. The failure is not being hidden: it is
+// in the journal, in the outcome record, and in what the successor reports.
 func (u *Updater) relaunchViaHelper(journalPath string, j *state) error {
 	if !exists(u.paths.HelperCopy) {
 		// The helper copy normally survives from an apply handoff; recreate it
