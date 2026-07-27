@@ -54,6 +54,30 @@ type Request struct {
 type Result struct {
 	Status Status
 	Error  string
+
+	// ProgramIntact reports whether the program may safely carry on running.
+	//
+	// True is the ordinary case and covers every refusal: the update was
+	// declined or abandoned while the program was completely untouched, and
+	// there is nothing to do but log it and continue.
+	//
+	// False means the update went past the point of no return and could not be
+	// undone. The drain has run, [Config.BeforeHandoff] has fired, and the
+	// binary on disk is no longer the image this process is running. Whatever
+	// the program shut down in preparation for the handover is still shut down,
+	// and no handover happened. A caller that carries on past a false is running
+	// a program whose shutdown has already taken place - for anything with
+	// resources to release, a licence to enforce or a lease to hold, the only
+	// correct response is to terminate and let a supervisor start the binary
+	// that is actually on disk.
+	//
+	// Status alone cannot express this. A pre-download refusal and a failed
+	// restore after a failed exec are both StatusFailed, and only one of them is
+	// survivable.
+	//
+	// The zero value is false on purpose: a Result nobody filled in must not
+	// read as "everything is fine".
+	ProgramIntact bool
 }
 
 // Source produces the bytes of a new binary.

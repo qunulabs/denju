@@ -142,11 +142,17 @@ func (n names) pathsFor(binaryPath string) paths {
 	}
 }
 
-// writeState atomically writes s as JSON to path: a temp file in the same
-// directory is written and fsync'd, then renamed over path, and the directory is
-// fsync'd best-effort. A reader never observes a half-written journal, and the
+// writeState atomically writes the journal. A package var so tests can fail one
+// specific write: the ordering guarantees around the journal only mean anything
+// when a write CAN fail, and the paths that have to survive one are exactly the
+// paths worth proving.
+var writeState = defaultWriteState
+
+// defaultWriteState writes s as JSON to path: a temp file in the same directory
+// is written and fsync'd, then renamed over path, and the directory is fsync'd
+// best-effort. A reader never observes a half-written journal, and the
 // write-ahead ordering survives a power cut.
-func writeState(n names, path string, s *state) error {
+func defaultWriteState(n names, path string, s *state) error {
 	if s == nil {
 		return errors.New("cannot write a nil update state")
 	}

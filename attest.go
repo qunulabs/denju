@@ -180,9 +180,28 @@ func (u *Updater) decide(ok bool, cause string) error {
 	}
 
 	if ok {
+		// The record is written FIRST, and it is the verdict: it is what the
+		// cooldown reads, what gets reported, and what startup repair consults
+		// when the journal and the disk disagree. Only a failure here can refuse
+		// the commit, because only here has nothing been claimed yet.
+		if err := u.records.record(&Outcome{
+			At:          time.Now(),
+			ID:          j.CommandID,
+			FromVersion: j.OldVersion,
+			ToVersion:   j.TargetVersion,
+			Status:      StatusSucceeded,
+		}); err != nil {
+			return fmt.Errorf("record the commit: %w", err)
+		}
+		// The journal is the file-state ledger that follows the verdict, so a
+		// failure to write it is a warning, not a reversal. Returning an error
+		// here would leave the journal at attesting with the commit already
+		// recorded, and every later start would count a crash against a version
+		// that attested healthy until the tolerance rolled it back. Repair
+		// reconciles this from the record instead.
 		j.Phase = phaseCommitted
 		if err := writeState(u.n, u.paths.State, j); err != nil {
-			return fmt.Errorf("journal the commit: %w", err)
+			u.log(LevelWarn, "could not journal the commit; the outcome record stands", "err", err)
 		}
 		// The rollback copy is released only here - the one point at which the
 		// new version has actually been proven.
@@ -190,13 +209,7 @@ func (u *Updater) decide(ok bool, cause string) error {
 		u.log(LevelInfo, "new version attested healthy; committed",
 			"version", j.TargetVersion,
 			"previous_version", j.OldVersion)
-		return u.records.record(&Outcome{
-			At:          time.Now(),
-			ID:          j.CommandID,
-			FromVersion: j.OldVersion,
-			ToVersion:   j.TargetVersion,
-			Status:      StatusSucceeded,
-		})
+		return nil
 	}
 
 	u.log(LevelError, "new version failed attestation; rolling back",
@@ -216,5 +229,9 @@ func (u *Updater) decide(ok bool, cause string) error {
 	}); err != nil {
 		u.log(LevelError, "could not write the update record", "err", err)
 	}
-	return u.rollbackAndRestart(j, cause)
+	if err := u.rollbackAndRestart(j, cause); err != nil {
+		u.correctFailedRollback(j, err)
+		return err
+	}
+	return nil
 }

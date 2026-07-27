@@ -66,6 +66,11 @@ func (u *Updater) isSelftest() bool { return os.Getenv(u.n.envSelftest) == "1" }
 // its own executable path: it IS a copy, living beside the real binary under a
 // different name, so os.Executable would point at the copy.
 func (u *Updater) runHelper() int {
+	// Set before anything can fail. openHelperLog sets it too, but it runs after
+	// the two early returns below, and those lines are exactly the ones an
+	// operator has to find in a log full of the program's own output.
+	helperLogPrefix = u.n.logPrefix
+
 	statePath := os.Getenv(u.n.envState)
 	if statePath == "" {
 		logf("no %s set in the environment; nothing to do", u.n.envState)
