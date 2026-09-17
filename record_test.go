@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -324,4 +325,179 @@ func TestStore_LeavesNoTempFiles(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Dir(s.path))
 	noErr(t, err, "read the directory")
 	eq(t, len(entries), 1, "only the record itself should remain")
+}
+
+func newScopedStore(t *testing.T) *store {
+	t.Helper()
+	s := newTestStore(t)
+	s.scope = CooldownRolledBackVersion
+	return s
+}
+
+func rolledBack(at time.Time, id, to string) *Outcome {
+	return &Outcome{At: at, ID: id, FromVersion: "1.4.0", ToVersion: to, Status: StatusRolledBack, Error: "soak failed"}
+}
+
+func TestScopedCooldown_HoldsOnlyTheRolledBackVersion(t *testing.T) {
+	s := newScopedStore(t)
+	now := time.Now()
+	noErr(t, s.record(rolledBack(now.Add(-time.Minute), "cmd-1", "1.5.0")), "record the rollback")
+
+	held, left, err := s.inCooldownFor("1.5.0", now)
+	noErr(t, err, "inCooldownFor")
+	isTrue(t, held, "the rolled-back version is held")
+	isTrue(t, left > testCooldown-2*time.Minute && left <= testCooldown-time.Minute, "remaining is measured from the rollback")
+
+	held, _, err = s.inCooldownFor("1.6.0", now)
+	noErr(t, err, "inCooldownFor")
+	isFalse(t, held, "any other target is admitted at once")
+
+	held, _, err = s.inCooldown(now)
+	noErr(t, err, "inCooldown")
+	isTrue(t, held, "inCooldown reports that some version is held")
+}
+
+// The record is the LAST attempt, so every later write must carry the hold
+// forward - or a failed download of something else would erase it, and a
+// refusal would restart it.
+func TestScopedCooldown_LaterAttemptsCarryTheHoldForward(t *testing.T) {
+	s := newScopedStore(t)
+	now := time.Now()
+	rolledAt := now.Add(-5 * time.Minute)
+	noErr(t, s.record(rolledBack(rolledAt, "cmd-1", "1.5.0")), "rollback")
+	noErr(t, s.record(&Outcome{At: now.Add(-4 * time.Minute), ID: "cmd-2", ToVersion: "1.6.0", Status: StatusFailed}), "a failed attempt")
+	noErr(t, s.record(&Outcome{At: now.Add(-3 * time.Minute), ID: "cmd-3", ToVersion: "1.5.0", Status: StatusRefusedCooldown}), "a refusal")
+	noErr(t, s.record(&Outcome{At: now.Add(-2 * time.Minute), ID: "cmd-4", ToVersion: "1.6.0", Status: StatusSucceeded}), "a success")
+
+	o, err := s.load()
+	noErr(t, err, "load")
+	eq(t, o.RolledBackVersion, "1.5.0", "the held version survives")
+	isTrue(t, o.RolledBackAt.Equal(rolledAt), "the hold's anchor does not move")
+
+	held, left, err := s.inCooldownFor("1.5.0", now)
+	noErr(t, err, "inCooldownFor")
+	isTrue(t, held, "still held")
+	isTrue(t, left <= testCooldown-5*time.Minute, "the window runs from the rollback, not from the latest attempt")
+}
+
+func TestScopedCooldown_ANewRollbackReplacesTheHold(t *testing.T) {
+	s := newScopedStore(t)
+	now := time.Now()
+	noErr(t, s.record(rolledBack(now.Add(-5*time.Minute), "cmd-1", "1.5.0")), "first rollback")
+	noErr(t, s.record(rolledBack(now.Add(-time.Minute), "cmd-2", "1.6.0")), "second rollback")
+
+	held, _, err := s.inCooldownFor("1.5.0", now)
+	noErr(t, err, "inCooldownFor")
+	isFalse(t, held, "the older rolled-back version is released")
+	held, _, err = s.inCooldownFor("1.6.0", now)
+	noErr(t, err, "inCooldownFor")
+	isTrue(t, held, "the newest rolled-back version is held")
+}
+
+func TestScopedCooldown_Expires(t *testing.T) {
+	s := newScopedStore(t)
+	now := time.Now()
+	noErr(t, s.record(rolledBack(now.Add(-testCooldown-time.Minute), "cmd-1", "1.5.0")), "an old rollback")
+
+	held, _, err := s.inCooldownFor("1.5.0", now)
+	noErr(t, err, "inCooldownFor")
+	isFalse(t, held, "an expired hold admits the version again")
+}
+
+// A zero cooldown holds nothing, and it does not read the record to find that
+// out: a record that cannot be parsed must not stop an update for a program that
+// never asked for anything to be held. The window arithmetic alone would admit
+// everything at zero, so the corrupt record is what pins the early return.
+//
+// It runs under the default scope because that is the only one a zero cooldown
+// can have: New rejects CooldownRolledBackVersion without a positive Cooldown.
+func TestZeroCooldown_HoldsNothingAndReadsNoRecord(t *testing.T) {
+	s := newTestStore(t)
+	s.cooldown = 0
+	now := time.Now()
+	noErr(t, s.record(rolledBack(now, "cmd-1", "1.5.0")), "rollback")
+
+	held, _, err := s.inCooldownFor("1.5.0", now)
+	noErr(t, err, "inCooldownFor")
+	isFalse(t, held, "no cooldown, no hold")
+
+	noErr(t, os.WriteFile(s.path, []byte("{"), 0o600), "corrupt")
+	held, _, err = s.inCooldownFor("1.5.0", now)
+	noErr(t, err, "a zero cooldown never reads the record")
+	isFalse(t, held, "no cooldown, no hold, even over a corrupt record")
+}
+
+// MarkReported rewrites the record to flag it delivered. It must not drop the
+// rollback anchor on the way, or reporting a rollback would release the very
+// version it held.
+func TestScopedCooldown_MarkReportedKeepsTheHold(t *testing.T) {
+	s := newScopedStore(t)
+	now := time.Now()
+	rolledAt := now.Add(-time.Minute)
+	noErr(t, s.record(rolledBack(rolledAt, "cmd-1", "1.5.0")), "rollback")
+
+	noErr(t, s.markReported(), "markReported")
+
+	o, err := s.load()
+	noErr(t, err, "load")
+	isTrue(t, o.Reported, "the record is marked reported")
+	eq(t, o.RolledBackVersion, "1.5.0", "the held version survives reporting")
+	isTrue(t, o.RolledBackAt.Equal(rolledAt), "the hold's anchor survives reporting")
+
+	held, _, err := s.inCooldownFor("1.5.0", now)
+	noErr(t, err, "inCooldownFor")
+	isTrue(t, held, "still held after reporting")
+}
+
+// Under the scoped cooldown a record that cannot be parsed would silently drop
+// the hold if it were overwritten, so every write fails loudly instead. The
+// default scope overwrites exactly as v0.3.0 did.
+func TestScopedCooldown_CorruptRecordFailsEveryWrite(t *testing.T) {
+	scoped := newScopedStore(t)
+	noErr(t, os.WriteFile(scoped.path, []byte("{"), 0o600), "corrupt")
+	wantErrContaining(t, scoped.record(&Outcome{At: time.Now(), ID: "cmd-2", ToVersion: "1.6.0", Status: StatusSucceeded}),
+		"corrupt", "a write over a corrupt record under the scoped cooldown")
+
+	legacy := newTestStore(t)
+	noErr(t, os.WriteFile(legacy.path, []byte("{"), 0o600), "corrupt")
+	noErr(t, legacy.record(&Outcome{At: time.Now(), ID: "cmd-2", ToVersion: "1.6.0", Status: StatusSucceeded}),
+		"the default scope overwrites exactly as before")
+}
+
+// The default scope is v0.3.0: every update is held, and the record carries no
+// new fields.
+func TestDefaultCooldownScope_IsUnchanged(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	noErr(t, s.record(rolledBack(now.Add(-time.Minute), "cmd-1", "1.5.0")), "rollback")
+
+	held, _, err := s.inCooldownFor("1.6.0", now)
+	noErr(t, err, "inCooldownFor")
+	isTrue(t, held, "the default scope still holds every update")
+
+	data, err := os.ReadFile(s.path)
+	noErr(t, err, "read the record")
+	isFalse(t, strings.Contains(string(data), "rolled_back_version"), "no rolled_back_version key")
+	isFalse(t, strings.Contains(string(data), "rolled_back_at"), "no rolled_back_at key")
+}
+
+func TestOutcomeWireCompatibility_RollbackAnchor(t *testing.T) {
+	const fixture = `{
+  "at": "2026-09-17T08:09:44Z",
+  "command_id": "cmd-42",
+  "from_version": "1.3.2",
+  "to_version": "1.4.0",
+  "status": "rolled_back",
+  "reported": false,
+  "cooldown_at": "2026-09-17T08:09:44Z",
+  "rolled_back_version": "1.4.0",
+  "rolled_back_at": "2026-09-17T08:09:44Z"
+}`
+	s := newScopedStore(t)
+	noErr(t, os.WriteFile(s.path, []byte(fixture), 0o600), "write the fixture")
+
+	o, err := s.load()
+	noErr(t, err, "parse")
+	eq(t, o.RolledBackVersion, "1.4.0", "rolled_back_version")
+	eq(t, o.RolledBackAt.UTC().Format(time.RFC3339), "2026-09-17T08:09:44Z", "rolled_back_at")
 }

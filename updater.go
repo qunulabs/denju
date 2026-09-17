@@ -45,6 +45,18 @@ func New(cfg Config) (*Updater, error) {
 		// would be reported as an interrupted one and undone.
 		return nil, errors.New("denju: Config.Version is required")
 	}
+	switch cfg.CooldownScope {
+	case CooldownAnyUpdate, CooldownRolledBackVersion:
+	default:
+		return nil, fmt.Errorf("denju: Config.CooldownScope %d is not a known scope", cfg.CooldownScope)
+	}
+	if cfg.CooldownScope == CooldownRolledBackVersion && cfg.Cooldown <= 0 {
+		// A hold with no duration holds nothing, yet the scope would still make
+		// every record write depend on reading the previous record - so a corrupt
+		// record would fail a Commit for a cooldown that can never refuse
+		// anything. That is a configuration mistake; say so here.
+		return nil, errors.New("denju: Config.CooldownScope CooldownRolledBackVersion needs a positive Config.Cooldown")
+	}
 	cfg = cfg.withDefaults()
 
 	binaryPath := cfg.BinaryPath
@@ -71,6 +83,7 @@ func New(cfg Config) (*Updater, error) {
 			path:       p.Record,
 			tmpPattern: n.tmpRecord,
 			cooldown:   cfg.Cooldown,
+			scope:      cfg.CooldownScope,
 		},
 	}
 	u.runSelftest = func(stagedPath string, args []string, cwd string) error {
@@ -156,9 +169,11 @@ func (u *Updater) PendingOutcome() (*Outcome, error) { return u.records.pending(
 // needs its timestamp.
 func (u *Updater) MarkReported() error { return u.records.markReported() }
 
-// InCooldown reports whether an update completed recently enough that another
-// should be refused, and how long remains. It is always false when
-// [Config.Cooldown] is zero.
+// InCooldown reports whether the cooldown is holding anything back right now,
+// and how long remains. Under [CooldownAnyUpdate] that means every update would
+// be refused; under [CooldownRolledBackVersion] it means only that some version
+// is held, while every other target is admitted - use [Updater.InCooldownFor] to
+// ask about a particular one. It is always false when [Config.Cooldown] is zero.
 //
 // [Updater.Update] checks this itself; the method is exported so a caller can
 // answer for itself without starting an update.
@@ -166,10 +181,23 @@ func (u *Updater) InCooldown(now time.Time) (bool, time.Duration, error) {
 	return u.records.inCooldown(now)
 }
 
+// InCooldownFor reports whether the cooldown would refuse an update to
+// targetVersion right now, and how long remains. Under [CooldownAnyUpdate] the
+// target makes no difference. It answers for the cooldown only: [Updater.Update]
+// refuses other things first, such as a target equal to [Config.Version].
+func (u *Updater) InCooldownFor(targetVersion string, now time.Time) (bool, time.Duration, error) {
+	return u.records.inCooldownFor(targetVersion, now)
+}
+
 // CleanupReported removes the update journal once its outcome has been
 // delivered. The outcome record survives - it is what the cooldown reads.
 //
 // Call it after [Updater.MarkReported].
+//
+// Under [Config.RetainPrevious] it first finishes a retention the commit could
+// not, and keeps the journal while that still fails. It is not called again for
+// an outcome already reported, so [Updater.Repair] finishes the retention on a
+// later start and removes the journal then.
 func (u *Updater) CleanupReported() {
 	if !exists(u.paths.State) {
 		return
@@ -177,6 +205,15 @@ func (u *Updater) CleanupReported() {
 	j, err := readState(u.paths.State)
 	if err != nil || (j.Phase != phaseCommitted && j.Phase != phaseRolledBack) {
 		return
+	}
+	if j.Phase == phaseCommitted && u.cfg.RetainPrevious {
+		if err := u.retainPrevious(j); err != nil {
+			// The journal is the only thing that says the rollback copy belongs
+			// to a committed update. Deleting it now would lose the binary.
+			u.log(LevelError, "could not retain the previous binary; keeping the journal so the next start tries again",
+				"err", err)
+			return
+		}
 	}
 	u.removeLeftovers()
 }
@@ -193,7 +230,9 @@ func (u *Updater) resolveServiceName() (string, error) {
 
 // removeLeftovers best-effort deletes every update artifact beside the binary
 // except the binary itself. The outcome record is not one of them: it outlives
-// the update.
+// the update. It never removes the retained previous binary or its record
+// (Config.RetainPrevious): they are not leftovers of this update, they are the
+// product of the last one.
 func (u *Updater) removeLeftovers() {
 	_ = os.Remove(u.paths.State)
 	_ = os.Remove(u.paths.Restart)

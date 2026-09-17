@@ -33,6 +33,10 @@ func TestNew_AppliesDefaults(t *testing.T) {
 	eq(t, u.cfg.DownloadTimeout, defaultDownloadTimeout, "DownloadTimeout")
 	eq(t, u.cfg.CrashTolerance, defaultCrashTolerance, "CrashTolerance")
 	eq(t, u.cfg.StaleThreshold, defaultStaleThreshold, "StaleThreshold")
+	eq(t, u.cfg.PartialRetention, defaultPartialRetention, "PartialRetention")
+	// Pinned as a literal, not only against its own constant: it is documented
+	// as 24 hours, and the SDK sizes its retry window against it.
+	eq(t, defaultPartialRetention, 24*time.Hour, "the documented PartialRetention default")
 	eq(t, u.cfg.Cooldown, time.Duration(0), "Cooldown defaults to disabled")
 }
 
@@ -120,3 +124,32 @@ func TestLog_PrefixesEveryLine(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestNew_RejectsAnUnknownCooldownScope(t *testing.T) {
+	_, err := New(Config{Namespace: "app", Version: "1.0.0", BinaryPath: "/opt/app/prog", CooldownScope: CooldownScope(7)})
+	wantErrContaining(t, err, "CooldownScope", "an unknown scope")
+}
+
+// A hold on a version for no time at all is a mistake in the program, not a
+// choice: it would still make every record write read the previous one first,
+// and fail on a corrupt record, while holding nothing.
+func TestNew_RejectsScopedCooldownWithoutADuration(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Minute} {
+		_, err := New(Config{Namespace: "app", Version: "1.0.0", BinaryPath: "/opt/app/prog",
+			CooldownScope: CooldownRolledBackVersion, Cooldown: d})
+		wantErrContaining(t, err, "positive Config.Cooldown", "a scoped cooldown of "+d.String())
+	}
+}
+
+func TestInCooldownFor(t *testing.T) {
+	u := testUpdater(t, scopedCooldown)
+	now := time.Now()
+	noErr(t, u.records.record(&Outcome{At: now.Add(-time.Minute), ID: "cmd-0", ToVersion: "1.5.0", Status: StatusRolledBack}), "seed")
+
+	held, _, err := u.InCooldownFor("1.5.0", now)
+	noErr(t, err, "InCooldownFor")
+	isTrue(t, held, "the rolled-back version")
+	held, _, err = u.InCooldownFor("1.6.0", now)
+	noErr(t, err, "InCooldownFor")
+	isFalse(t, held, "another version")
+}

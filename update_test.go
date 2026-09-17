@@ -661,3 +661,98 @@ func TestUpdate_ConfiguredServiceNameIsUsed(t *testing.T) {
 	noErr(t, err, "readState")
 	eq(t, j.ServiceName, "my-service", "the configured service name is journaled")
 }
+
+// ---------------------------------------------------------------- failure kinds
+
+// A caller has to be able to tell a transfer worth retrying from a download that
+// is simply wrong, without parsing a message meant for a human. The message
+// itself must not change: existing consumers log and report it verbatim.
+func TestUpdate_DownloadFailuresCarryTheirKind(t *testing.T) {
+	t.Run("a source error", func(t *testing.T) {
+		r := newUpdateRig(t)
+		r.src.err = errors.New("the connection dropped")
+
+		got := r.u.Update(context.Background(), r.req(), r.src)
+		isTrue(t, errors.Is(got.Cause, ErrDownloadFailed), "Cause is a download failure")
+		isFalse(t, errors.Is(got.Cause, ErrChecksumMismatch), "Cause is not a checksum mismatch")
+		isTrue(t, errors.Is(got.Cause, r.src.err), "the source's own error stays reachable")
+		eq(t, got.Error, "download the update: the connection dropped", "the message is unchanged")
+	})
+
+	t.Run("a checksum mismatch", func(t *testing.T) {
+		r := newUpdateRig(t)
+		req := r.req()
+		req.SHA256 = sha256Hex([]byte("something else entirely"))
+
+		got := r.u.Update(context.Background(), req, r.src)
+		isTrue(t, errors.Is(got.Cause, ErrChecksumMismatch), "Cause is a checksum mismatch")
+		isFalse(t, errors.Is(got.Cause, ErrDownloadFailed), "Cause is not a download failure")
+		isTrue(t, strings.HasPrefix(got.Error, "the downloaded update does not match its checksum: expected "),
+			"the message is unchanged")
+	})
+}
+
+// Cause is never left nil beside a non-empty Error, and a failure that is not a
+// download failure carries no download kind. This drives one refusal; the
+// property holds for every path because they all build their Result in
+// recordWith, from the one error.
+func TestUpdate_EveryFailureCarriesACause(t *testing.T) {
+	r := newUpdateRig(t)
+
+	got := r.u.Update(context.Background(), Request{ID: "cmd-1"}, r.src)
+	if got.Cause == nil {
+		t.Fatal("a refused update must carry a Cause")
+	}
+	eq(t, got.Cause.Error(), got.Error, "Cause and Error say the same thing")
+	isFalse(t, errors.Is(got.Cause, ErrDownloadFailed), "an incomplete request is not a download failure")
+	isFalse(t, errors.Is(got.Cause, ErrChecksumMismatch), "an incomplete request is not a checksum mismatch")
+}
+
+// The offset describes bytes denju itself holds on disk. A caller that sets it
+// is asking denju to trust bytes it never wrote.
+func TestUpdate_CallerSetOffsetIsRefused(t *testing.T) {
+	r := newUpdateRig(t)
+	req := r.req()
+	req.Offset = 5
+
+	got := r.u.Update(context.Background(), req, r.src)
+	eq(t, got.Status, StatusFailed, "status")
+	hasSubstr(t, got.Error, "Offset", "error")
+	isTrue(t, got.ProgramIntact, "refused before anything happened")
+	eq(t, r.src.calls, 0, "nothing is downloaded")
+}
+
+func scopedCooldown(c *Config) {
+	c.Cooldown = testCooldown
+	c.CooldownScope = CooldownRolledBackVersion
+}
+
+// The version that was just rolled back is not re-applied, and nothing is
+// downloaded to find that out.
+func TestUpdate_ScopedCooldownRefusesTheRolledBackVersion(t *testing.T) {
+	withGOOS(t, "linux")
+	r := newUpdateRig(t, scopedCooldown)
+	noErr(t, r.u.records.record(&Outcome{
+		At: time.Now().Add(-time.Minute), ID: "cmd-0",
+		FromVersion: "1.4.0", ToVersion: "1.5.0", Status: StatusRolledBack,
+	}), "seed a rollback of 1.5.0")
+
+	got := r.u.Update(context.Background(), r.req(), r.src) // target 1.5.0
+	eq(t, got.Status, StatusRefusedCooldown, "status")
+	hasSubstr(t, got.Error, "1.5.0 was rolled back", "error")
+	isTrue(t, got.ProgramIntact, "a refusal leaves the program intact")
+	eq(t, r.src.calls, 0, "nothing is downloaded")
+}
+
+// A corrective update lands at once, which is the reason the scope exists.
+func TestUpdate_ScopedCooldownAdmitsACorrectiveUpdate(t *testing.T) {
+	withGOOS(t, "linux")
+	r := newUpdateRig(t, scopedCooldown)
+	noErr(t, r.u.records.record(&Outcome{
+		At: time.Now().Add(-time.Minute), ID: "cmd-0",
+		FromVersion: "1.4.0", ToVersion: "1.4.9", Status: StatusRolledBack,
+	}), "seed a rollback of 1.4.9")
+
+	got := r.u.Update(context.Background(), r.req(), r.src) // target 1.5.0
+	eq(t, got.Status, StatusSucceeded, "a different target is admitted")
+}

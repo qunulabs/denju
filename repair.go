@@ -30,11 +30,15 @@ func (u *Updater) Repair() error {
 	if !exists(p.State) {
 		// No update in flight. Reclaim leftovers: a discard file (a rolled-back
 		// Windows binary, undeletable while its process ran), a helper copy, a
-		// stale restart journal, or a helper log.
+		// stale restart journal, a helper log, or a partial download nothing has
+		// written to for longer than PartialRetention.
 		_ = os.Remove(p.Discard)
 		_ = os.Remove(p.HelperCopy)
 		_ = os.Remove(p.HelperLog)
 		_ = os.Remove(p.Restart)
+		// Partials only when nothing is in flight: with a journal present a
+		// completed partial may be the journal's staged binary.
+		u.discardStalePartials(time.Now())
 		return nil
 	}
 	j, err := readState(p.State)
@@ -54,9 +58,14 @@ func (u *Updater) Repair() error {
 		}
 		return u.repairInterruptedOldImage(j)
 	case phaseCommitted:
-		return u.repairDecided(j, StatusSucceeded, "")
+		if !u.cfg.RetainPrevious {
+			_, err := u.repairDecided(j, StatusSucceeded, "")
+			return err
+		}
+		return u.repairCommittedRetaining(j)
 	case phaseRolledBack:
-		return u.repairDecided(j, StatusRolledBack, j.ErrorMessage)
+		_, err := u.repairDecided(j, StatusRolledBack, j.ErrorMessage)
+		return err
 	default:
 		return u.repairStale(j)
 	}
@@ -86,8 +95,67 @@ func (u *Updater) Repair() error {
 // The status must match what the deciding path records for the same phase, or
 // the idempotence guard stops matching and every start rewrites the record,
 // pushing the cooldown anchor forward forever.
-func (u *Updater) repairDecided(j *state, status Status, cause string) error {
-	u.recordRepairOutcome(j, status, cause)
+//
+// A record written AFTER the journal took its verdict is left alone too, whatever
+// it describes. The record holds only the last attempt, and the journal stays
+// until its outcome is reported, so a later attempt - the refusal of a re-issued
+// command, a failed download - can replace the decided outcome as the record
+// while the journal is still on disk. That is not a missing record. Re-recording
+// the verdict over it would restart the cooldown (and under
+// CooldownRolledBackVersion the hold) at a full window, report the old outcome a
+// second time, and overwrite the later attempt before it was reported. The
+// journal's modification time is when it took the verdict: nothing rewrites a
+// decided journal.
+//
+// The same rule keeps a dead Windows handoff a failure. repairStagedHandoff
+// journals it rolledback and records it failed, straight after; without the
+// rule the next start would find the status mismatch and re-record it as
+// rolled_back, which under CooldownRolledBackVersion holds a version that never
+// ran.
+//
+// settled reports whether the outcome is on record - recorded now, already, or
+// superseded by a later attempt - so a caller may drop the journal.
+func (u *Updater) repairDecided(j *state, status Status, cause string) (settled bool, err error) {
+	if j.CommandID == "" {
+		return true, nil // nothing to report against, and so nothing to hold
+	}
+	info, err := os.Stat(u.paths.State)
+	if err != nil {
+		return false, fmt.Errorf("inspect the update journal: %w", err)
+	}
+	prev, err := u.records.load()
+	if err != nil {
+		u.log(LevelError, "could not read the update record", "err", err)
+		return false, nil
+	}
+	if prev != nil && prev.At.After(info.ModTime()) {
+		return true, nil
+	}
+	return u.recordRepairOutcome(j, status, cause), nil
+}
+
+// repairCommittedRetaining resolves a committed journal under RetainPrevious.
+//
+// A retention the commit could not finish - interrupted by a crash, or failed -
+// is finished here, on every start while the journal exists. Once it succeeds
+// and the outcome is on record, the journal has nothing left to protect, and
+// Repair removes it with the other leftovers (the Windows helper copy and its
+// log among them). CleanupReported cannot be relied on for that: the documented
+// wiring calls it only when PendingOutcome has something, and an outcome
+// reported on the start whose retention failed is never pending again. While the
+// journal stays, the stale-partial sweep below does not run either.
+func (u *Updater) repairCommittedRetaining(j *state) error {
+	if err := u.retainPrevious(j); err != nil {
+		u.log(LevelError, "could not retain the previous binary; it stays as the rollback copy and is retried on the next start",
+			"err", err)
+		_, err := u.repairDecided(j, StatusSucceeded, "")
+		return err
+	}
+	settled, err := u.repairDecided(j, StatusSucceeded, "")
+	if err != nil || !settled {
+		return err
+	}
+	u.removeLeftovers()
 	return nil
 }
 
@@ -99,8 +167,10 @@ func (u *Updater) repairDecided(j *state, status Status, cause string) error {
 //
 // The outcome is recorded as failed rather than rolled back: the helper died
 // before the swap, so the binary on disk was never replaced and there was
-// nothing to roll back. Either way it holds the cooldown, so a handoff that
-// cannot start is not retried in a tight loop.
+// nothing to roll back. Under CooldownAnyUpdate a failure holds the cooldown
+// like any completed attempt, so a handoff that cannot start is not retried in a
+// tight loop. Under CooldownRolledBackVersion it holds nothing, on purpose: that
+// scope holds a version that ran and failed, and this target never ran.
 func (u *Updater) repairStagedHandoff(j *state) error {
 	if pidAlive(j.HelperPID) {
 		u.log(LevelWarn, "an update helper is still running; leaving the journal to it",
@@ -154,7 +224,7 @@ func (u *Updater) reconcileCommitted(j *state) error {
 		u.log(LevelError, "could not reconcile the committed journal", "err", err)
 		return nil
 	}
-	_ = os.Remove(u.paths.RollbackBinary)
+	u.releaseRollbackCopy(j)
 	return nil
 }
 
@@ -215,17 +285,19 @@ func (u *Updater) repairInterruptedOldImage(j *state) error {
 // An outcome already recorded for this update is not overwritten. Repair runs on
 // every start, and re-recording would keep pushing the cooldown anchor forward,
 // turning a single failed update into an indefinite refusal.
-func (u *Updater) recordRepairOutcome(j *state, status Status, cause string) {
+//
+// It reports whether the outcome is on record afterwards.
+func (u *Updater) recordRepairOutcome(j *state, status Status, cause string) bool {
 	if j.CommandID == "" {
-		return // nothing to report against, and so nothing to hold
+		return true // nothing to report against, and so nothing to hold
 	}
 	prev, err := u.records.load()
 	if err != nil {
 		u.log(LevelError, "could not read the update record", "err", err)
-		return
+		return false
 	}
 	if prev != nil && prev.ID == j.CommandID && prev.Status == status {
-		return
+		return true
 	}
 	if err := u.records.record(&Outcome{
 		At:          time.Now(),
@@ -236,7 +308,9 @@ func (u *Updater) recordRepairOutcome(j *state, status Status, cause string) {
 		Error:       cause,
 	}); err != nil {
 		u.log(LevelError, "could not write the update record", "err", err)
+		return false
 	}
+	return true
 }
 
 // correctFailedRollback rewrites a rolled_back record once the rollback it

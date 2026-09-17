@@ -8,6 +8,43 @@ import (
 	"time"
 )
 
+// CooldownScope selects what [Config.Cooldown] holds back.
+type CooldownScope int
+
+const (
+	// CooldownAnyUpdate refuses every update for Cooldown after one completes -
+	// succeeded, failed or rolled back. The default, and the only behaviour
+	// before scopes existed. It also stops a control plane flip-flopping a
+	// program between two versions that both work.
+	CooldownAnyUpdate CooldownScope = iota
+	// CooldownRolledBackVersion refuses only the version most recently rolled
+	// back, for Cooldown after that rollback, and admits every other target at
+	// once. It closes the update-rollback-update loop without also blocking the
+	// corrective update that should follow a bad one, or a move back to the
+	// version the program just left.
+	//
+	// Versions are matched by string.
+	//
+	// Under this scope every write to the outcome record reads the previous
+	// record first, so that a record that cannot be parsed never silently drops
+	// the hold. The consequence of a corrupt record is severe, and is accepted
+	// because only damage to the disk produces one: every write fails, so every
+	// later update is refused - the corrective one included - and nothing can be
+	// recorded or reported. A [Updater.Commit] is refused as well, which leaves the
+	// update undecided: the new version keeps running, but every start of it
+	// counts against [Config.CrashTolerance], the one that attested included, and
+	// on start CrashTolerance+1 startup repair rolls back a version that was
+	// healthy. Nothing remote can recover the host; the record has to be removed
+	// or repaired on it.
+	//
+	// The hold needs denju v0.4.0 or later with this scope on BOTH images of an
+	// update: the image rolled back FROM normally writes it, and the image rolled
+	// back TO enforces it and carries it forward. See the README.
+	//
+	// It needs a positive Cooldown: [New] rejects it with a zero or negative one.
+	CooldownRolledBackVersion
+)
+
 // Config describes how denju should update one particular program.
 //
 // Only Namespace and Version are required. Every timeout has a default that
@@ -107,7 +144,35 @@ type Config struct {
 	// situations are unbounded loops: update, roll back, be told to update
 	// again, forever, re-downloading every cycle. Thirty minutes is a sensible
 	// starting value.
+	//
+	// [Config.CooldownScope] decides what is held: every update (the default) or
+	// only the version most recently rolled back.
 	Cooldown time.Duration
+
+	// CooldownScope is what Cooldown holds back. The zero value,
+	// [CooldownAnyUpdate], is the behaviour Cooldown has always had.
+	// [CooldownRolledBackVersion] requires a positive Cooldown.
+	CooldownScope CooldownScope
+
+	// RetainPrevious keeps the binary an update replaced once that update is
+	// committed, as <binary>.<namespace>-previous, instead of deleting it.
+	// [Updater.PreviousBinary] reports it and [FileSource] installs it, so moving
+	// back to the version the program just left reads nothing from any network.
+	//
+	// One generation is kept: the next committed update replaces it. A rollback
+	// does not touch it - the program is back on the binary the update replaced,
+	// and the retained one is still the one before that. It costs one binary's
+	// worth of disk for good. The rollback copy is a hardlink on Unix and costs
+	// nothing extra, so the peak while an update is in flight is the running
+	// binary, the download in progress and the retained one, plus a full copy of
+	// the binary for the detached helper on Windows.
+	//
+	// Never execute the retained file in place. On Windows a running .exe cannot
+	// be replaced, so the next commit could not retain over it.
+	//
+	// Turning it off later does not remove a binary already retained, and
+	// [Updater.PreviousBinary] still reports it.
+	RetainPrevious bool
 
 	// DrainTimeout bounds Drain. Default 2 minutes.
 	DrainTimeout time.Duration
@@ -129,6 +194,13 @@ type Config struct {
 	// StaleThreshold is how old an unresolvable journal must be before startup
 	// repair treats it as garbage. Default 1 hour.
 	StaleThreshold time.Duration
+	// PartialRetention bounds how long an interrupted download is kept for a
+	// retry to resume. A partial nothing has written to for longer is deleted,
+	// by the next download or by [Updater.Repair] on a start with no update in
+	// flight. Default 24 hours.
+	//
+	// Only a [ResumableSource] ever leaves a partial behind.
+	PartialRetention time.Duration
 }
 
 // Defaults, applied by [New] to any zero-valued field.
@@ -139,6 +211,7 @@ const (
 	defaultDownloadTimeout  = 15 * time.Minute
 	defaultCrashTolerance   = 2
 	defaultStaleThreshold   = 1 * time.Hour
+	defaultPartialRetention = 24 * time.Hour
 )
 
 // withDefaults returns cfg with every unset tunable filled in.
@@ -160,6 +233,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.StaleThreshold == 0 {
 		c.StaleThreshold = defaultStaleThreshold
+	}
+	if c.PartialRetention == 0 {
+		c.PartialRetention = defaultPartialRetention
 	}
 	return c
 }
@@ -204,12 +280,22 @@ type names struct {
 	sufLog     string // .<ns>-update.log
 	sufRecord  string // .<ns>-record.json
 
+	// The binary kept by Config.RetainPrevious, and the record describing it.
+	sufPrevious       string // .<ns>-previous
+	sufPreviousRecord string // .<ns>-previous.json
+
+	// A partial download is <binary><prePartial><key><extPartial>, where key
+	// is derived from the request (partialKey). Only a ResumableSource leaves one.
+	prePartial string // .<ns>-download-
+	extPartial string // .partial
+
 	// Patterns for os.CreateTemp, all created in the binary's own directory so
 	// the rename that follows is same-filesystem and therefore atomic.
 	tmpState     string // .<ns>-state-*
 	tmpDownload  string // .<ns>-update-*
 	tmpPermCheck string // .<ns>-permcheck-*
 	tmpRecord    string // .<ns>-record-*
+	tmpPrevious  string // .<ns>-previous-*
 
 	// logPrefix tags every line the detached Windows helper writes, which cannot
 	// go through the caller's logger.
@@ -231,10 +317,17 @@ func newNames(ns string) names {
 		sufLog:     "." + ns + "-update.log",
 		sufRecord:  "." + ns + "-record.json",
 
+		sufPrevious:       "." + ns + "-previous",
+		sufPreviousRecord: "." + ns + "-previous.json",
+
+		prePartial: "." + ns + "-download-",
+		extPartial: ".partial",
+
 		tmpState:     "." + ns + "-state-*",
 		tmpDownload:  "." + ns + "-update-*",
 		tmpPermCheck: "." + ns + "-permcheck-*",
 		tmpRecord:    "." + ns + "-record-*",
+		tmpPrevious:  "." + ns + "-previous-*",
 
 		logPrefix: ns + "-updater: ",
 	}
