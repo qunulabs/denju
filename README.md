@@ -139,7 +139,8 @@ type Source interface {
 
 denju owns everything around it: creating the temp file in the target binary's directory
 so the rename that follows is atomic, hashing what is written against `Request.SHA256`,
-making it executable, and deleting it on any failure.
+making it executable, and deleting it on any failure (a `ResumableSource`, below, keeps it
+after a broken transfer). Return a write error from `w` rather than swallowing it.
 
 For a plain HTTPS GET, `github.com/qunulabs/denju/httpsource` is about forty lines and
 keeps `net/http` out of the core:
@@ -147,6 +148,59 @@ keeps `net/http` out of the core:
 ```go
 src := httpsource.New(url, httpsource.WithMaxBytes(512<<20))
 ```
+
+### Resuming an interrupted download
+
+A `Source` that also implements `denju.ResumableSource` declares that it honours
+`Request.Offset`:
+
+```go
+type ResumableSource interface {
+    Source
+    ResumesFromOffset() // a declaration; denju never calls it
+}
+```
+
+For such a source a broken transfer keeps the bytes that arrived, in
+`<binary>.<ns>-download-<key>.partial`, where the key is derived from the request's
+`ID`, `TargetVersion` and `SHA256`. Calling `Update` again with the same three resumes:
+denju re-hashes what is on disk, sets `Request.Offset`, and your `Fetch` writes only the
+rest. The digest check still covers every byte.
+
+A broken transfer is the only failure that keeps the partial. It is deleted when writing
+to it fails (a full disk: keeping it would hold the space that just ran out), when your
+source returns an error wrapping `denju.ErrResumeRejected` (it cannot continue from that
+offset), when the complete file fails the digest, when flushing or finalizing it after a
+successful `Fetch` fails, and when a download for a different request starts. Each of
+those ends the attempt: denju never restarts a transfer by itself inside one `Update`, so
+it is the *next* call that starts from zero. A partial nothing has written to for
+`Config.PartialRetention` (default 24 hours) is deleted at the start of the call that finds
+it, which then proceeds from zero itself. If a delete fails — on Windows, another program
+holding the file — denju logs it at ERROR and the error says the partial could not be
+deleted; the next attempt finds it again.
+
+Leave `Request.Offset` zero — it is denju's. A plain `Source`, `httpsource` included, is
+unaffected: it always sees zero and never leaves a partial behind. A download through a
+plain `Source` deletes every partial first, including one an earlier resumable attempt at
+the same request left.
+
+Use **one `Updater` per binary**, across processes as well as within one. Two Updaters
+downloading beside the same binary delete each other's partials as belonging to a
+different request, and nothing enforces the rule.
+
+Tell failures apart with `errors.Is` on `Result.Cause`. `Result.Error` carries the same
+text as before.
+
+| Kind | Meaning | Retry |
+|---|---|---|
+| `ErrDownloadFailed` | the transfer failed or timed out | worth retrying; a `ResumableSource` resumes |
+| `ErrResumeRejected` | the source cannot continue from the offset | the next attempt starts from zero |
+| `ErrResumedChecksumMismatch` | a download that resumed failed the digest: the kept bytes may be damaged, or the source ignored the offset | **retry once from zero**; a second mismatch is `ErrChecksumMismatch` |
+| `ErrChecksumMismatch` | a download from byte zero failed the digest: the artifact is wrong | permanent |
+
+The two mismatch kinds are distinct: `errors.Is(err, ErrChecksumMismatch)` is false for a
+resumed mismatch. Every other failure, including a local one such as a full disk, carries
+no kind.
 
 ## What denju verifies
 
@@ -174,6 +228,9 @@ every environment variable it sets:
 | discarded binary (Windows) | `<binary>.<ns>-update.discard` |
 | helper log (Windows) | `<binary>.<ns>-update.log` |
 | outcome record | `<binary>.<ns>-record.json`, or `Config.RecordPath` |
+| partial download | `<binary>.<ns>-download-<key>.partial` (a `ResumableSource` only) |
+| retained previous binary | `<binary>.<ns>-previous` (`RetainPrevious` only) |
+| its record | `<binary>.<ns>-previous.json` |
 | environment | `<NS>_UPDATE_MODE`, `<NS>_UPDATE_STATE`, `<NS>_SELFTEST` |
 
 These names are an on-disk contract between consecutive versions of your program: the
@@ -203,10 +260,60 @@ deterministically: an interrupted swap is finished or undone, a new version that
 crashing before it can attest is rolled back after `CrashTolerance` starts, and an
 orphaned journal from a crash long past is collected.
 
-**`Cooldown`** (off by default) refuses a new update for a while after one completes.
-Turn it on if your control plane can command a downgrade, or can re-issue an update to a
-program that just rolled one back — without it, those are unbounded loops that
-re-download the binary every cycle.
+**`Cooldown`** (off by default) refuses updates for a while. `Config.CooldownScope`
+decides which: `CooldownAnyUpdate` (the default, and the only behaviour before v0.4.0)
+refuses every update after one completes; `CooldownRolledBackVersion` refuses only the
+version most recently rolled back and admits every other target at once, so a corrective
+update or a move back to the retained binary is not held unless that version is itself
+the one just rolled back. Turn it on if your control plane can re-issue an update to a
+program that just rolled it back — without it that is an unbounded loop that re-downloads
+the binary every cycle. `InCooldownFor` answers for a particular target.
+
+## Keeping the previous binary
+
+With `Config.RetainPrevious`, a commit keeps the binary the update replaced as
+`<binary>.<ns>-previous`, described by `<binary>.<ns>-previous.json`, instead of deleting
+it. One generation is kept; the next commit replaces it, and a rollback leaves it alone.
+
+```go
+if path, sum, _, ok := u.PreviousBinary(); ok && strings.EqualFold(sum, req.SHA256) {
+    u.Update(ctx, req, denju.FileSource(path)) // no network at all
+}
+```
+
+`FileSource` is verified against `Request.SHA256` like any source. Budget the disk: one
+extra binary for good. The rollback copy costs nothing extra on Unix — it is a hardlink
+to the running binary — so the peak while an update is in flight is the running binary,
+the download in progress and the retained one, plus a full copy of the binary for the
+detached helper on Windows. Never run the retained file in place.
+
+If keeping it fails at the commit, the commit still stands: the replaced binary stays as
+`<binary>.old`, and `CleanupReported` and every later `Repair` try again. Once it succeeds,
+`Repair` removes the leftover journal itself.
+
+The scoped cooldown and the retained binary each depend on particular images having
+v0.4.0:
+
+- **The scoped hold needs both images** — the one rolled back from and the one rolled
+  back to — on denju v0.4.0 or later with `CooldownRolledBackVersion`.
+  - The image rolled back **from** (the update's target) writes the hold. An attestation
+    failure and a crash loop both record the rollback, with the hold, before restoring
+    the previous binary.
+  - The image rolled back **to** reads and enforces the hold when the next command
+    arrives, and carries it forward on every later write. An image on an older denju
+    enforces nothing, and drops the hold on its next record write (`MarkReported`
+    included, through the 0.3.0 `Outcome` shape, which has no field to carry it).
+  - The image rolled back to records the rollback itself only when nothing has recorded
+    it (the new version never started, or the record write failed), and it never adds a
+    hold to a rollback that is already recorded.
+  - So when a program on v0.4.0 is moved back to a build on denju v0.3.0, and that build
+    fails and is rolled back, the v0.4.0 program is **not** held: the older build recorded
+    the rollback without a hold. It will accept the same move again at once. Denju does
+    not stop that loop; the control plane has to, for example by pausing the rollout on
+    the first failure.
+- **The retained binary** is created by the image that **commits** — the update's target.
+  It needs denju v0.4.0 or later with `RetainPrevious`; a commit by an image on an older
+  denju deletes the replaced binary instead of keeping it.
 
 ## Running the tests
 

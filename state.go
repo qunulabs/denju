@@ -27,7 +27,8 @@ const (
 	// that it works.
 	phaseAttesting = "attesting"
 	// phaseCommitted means the new image attested healthy; the update is
-	// permanent and the rollback copy has been discarded.
+	// permanent and the rollback copy has been discarded, or kept as the
+	// retained previous binary.
 	phaseCommitted = "committed"
 	// phaseRolledBack means the update was undone; the cause is in ErrorMessage.
 	phaseRolledBack = "rolledback"
@@ -123,6 +124,11 @@ type paths struct {
 	// Record is the durable outcome record. Unlike everything else here it may
 	// be relocated by Config.RecordPath, because it has to outlive the journal.
 	Record string
+	// Previous is the binary kept by Config.RetainPrevious after a commit, and
+	// PreviousRecord describes it (version and SHA-256). Neither is a leftover:
+	// no cleanup path removes them.
+	Previous       string
+	PreviousRecord string
 }
 
 // pathsFor derives the update file paths for the binary at binaryPath.
@@ -139,6 +145,8 @@ func (n names) pathsFor(binaryPath string) paths {
 		Discard:        binaryPath + n.sufDiscard,
 		HelperLog:      binaryPath + n.sufLog,
 		Record:         binaryPath + n.sufRecord,
+		Previous:       binaryPath + n.sufPrevious,
+		PreviousRecord: binaryPath + n.sufPreviousRecord,
 	}
 }
 

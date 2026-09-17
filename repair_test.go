@@ -1,6 +1,8 @@
 package denju
 
 import (
+	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -514,8 +516,8 @@ func TestRepair_OldImageRecordsTheRollback(t *testing.T) {
 }
 
 // A dead Windows helper never reached the swap, so the binary was never
-// replaced: the honest outcome is failed, not rolled back. It holds the cooldown
-// either way.
+// replaced: the honest outcome is failed, not rolled back. Under the default
+// scope it holds the cooldown like any completed attempt.
 func TestRepair_DeadHelperRecordsAFailure(t *testing.T) {
 	f := newRepairFixture(t, "program", "1.3.0")
 	staged := filepath.Join(f.dir, ".app-update-staged")
@@ -589,4 +591,227 @@ func TestRepair_NoRequestIDRecordsNothing(t *testing.T) {
 	if rec != nil {
 		t.Fatalf("expected no record, got %+v", rec)
 	}
+}
+
+// A partial for an update that never came back is reclaimed once it is past
+// retention, so a host that stops updating does not hold hundreds of megabytes
+// forever. A fresh one may still be resumed and is kept.
+func TestRepair_NoJournalDiscardsStalePartials(t *testing.T) {
+	f := newRepairFixture(t, "program", "1.0.0")
+	f.u.cfg.PartialRetention = time.Hour
+	stale := f.u.partialPath(Request{ID: "cmd-old", TargetVersion: "0.9.0", SHA256: "aa"})
+	fresh := f.u.partialPath(Request{ID: "cmd-new", TargetVersion: "1.1.0", SHA256: "bb"})
+	writeBinary(t, stale, "half an old download")
+	backdate(t, stale, 2*time.Hour)
+	writeBinary(t, fresh, "half a current download")
+
+	noErr(t, f.u.Repair(), "Repair")
+
+	isFalse(t, exists(stale), "a stale partial is reclaimed")
+	isTrue(t, exists(fresh), "a fresh partial is kept for its retry")
+}
+
+// With an update in flight the journal may point at a completed partial as the
+// staged binary, so repair leaves partials alone.
+func TestRepair_PartialsAreLeftAloneWhileAnUpdateIsInFlight(t *testing.T) {
+	f := newRepairFixture(t, "program", "1.0.0")
+	f.u.cfg.PartialRetention = time.Hour
+	staged := f.u.partialPath(Request{ID: "cmd-1", TargetVersion: "1.1.0", SHA256: "aa"})
+	writeBinary(t, staged, "a verified download")
+	backdate(t, staged, 2*time.Hour)
+	stageJournal(t, f.u, &state{Phase: phaseStaged, HelperPID: 999, NewBinaryPath: staged})
+	withPIDAlive(t, func(int) bool { return true })
+
+	noErr(t, f.u.Repair(), "Repair")
+
+	isTrue(t, exists(staged), "the journal's staged binary is not a leftover")
+}
+
+// scopeRepairFixture puts a repair fixture under CooldownRolledBackVersion. The
+// store takes its scope at New, so both have to change.
+func scopeRepairFixture(f repairFixture) {
+	f.u.cfg.CooldownScope = CooldownRolledBackVersion
+	f.u.records.scope = CooldownRolledBackVersion
+}
+
+// A rollback whose report failed keeps its journal, and anything recorded after
+// it - here the refusal of the re-issued command - replaces it as the last
+// attempt. Repair on the next start must not take that for a missing record:
+// re-recording the rollback would restart the hold at a full window, report the
+// old outcome a second time, and overwrite the refusal nobody has reported yet.
+func TestRepair_DoesNotReRecordARollbackOverALaterAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scoped bool
+	}{
+		{name: "default scope"},
+		{name: "rolled-back-version scope", scoped: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRepairFixture(t, "old-binary", "1.3.0")
+			if tc.scoped {
+				scopeRepairFixture(f)
+			}
+			rolledBackAt := time.Now().Add(-25 * time.Minute)
+			noErr(t, f.u.records.record(&Outcome{
+				At: rolledBackAt, ID: "cmd-1", FromVersion: "1.3.0", ToVersion: "1.4.0",
+				Status: StatusRolledBack, Error: "the probe failed",
+			}), "seed the rollback")
+			stageJournal(t, f.u, &state{
+				Phase: phaseRolledBack, CommandID: "cmd-1",
+				OldVersion: "1.3.0", TargetVersion: "1.4.0", ErrorMessage: "the probe failed",
+			})
+			backdate(t, f.p.State, 25*time.Minute)
+
+			got := f.u.Update(context.Background(),
+				Request{ID: "cmd-2", TargetVersion: "1.4.0", SHA256: sha256Hex([]byte("new"))}, &fakeSource{})
+			eq(t, got.Status, StatusRefusedCooldown, "the re-issued command is refused")
+
+			noErr(t, f.u.Repair(), "the next start's Repair")
+
+			rec, err := f.u.records.load()
+			noErr(t, err, "load the record")
+			eq(t, rec.ID, "cmd-2", "the later attempt is still the record")
+			eq(t, rec.Status, StatusRefusedCooldown, "and still a refusal")
+			isFalse(t, rec.Reported, "still owed to the caller")
+			isTrue(t, rec.CooldownAt.Equal(rolledBackAt), "the cooldown anchor did not move")
+			if tc.scoped {
+				isTrue(t, rec.RolledBackAt.Equal(rolledBackAt), "the hold did not restart")
+				eq(t, rec.RolledBackVersion, "1.4.0", "the held version")
+			}
+			_, left, err := f.u.InCooldownFor("1.4.0", time.Now())
+			noErr(t, err, "InCooldownFor")
+			isTrue(t, left < 6*time.Minute, "about five minutes of the hold remain, not a fresh window")
+		})
+	}
+}
+
+// A Windows handoff whose helper died before the swap never ran the target, so
+// under CooldownRolledBackVersion it holds nothing: the failure is recorded as
+// failed, and the target may be retried at once. The journal it leaves says
+// rolledback, and the next start must not re-record that as rolled_back - which
+// would hold a version that never ran.
+func TestRepair_DeadHelperUnderTheScopedCooldownStaysAFailureAndHoldsNothing(t *testing.T) {
+	f := newRepairFixture(t, "program", "1.3.0")
+	scopeRepairFixture(f)
+	staged := filepath.Join(f.dir, ".app-update-staged")
+	writeBinary(t, staged, "new")
+	stageJournal(t, f.u, &state{
+		Phase: phaseStaged, CommandID: "cmd-10", HelperPID: 999,
+		OldVersion: "1.3.0", TargetVersion: "1.4.0", NewBinaryPath: staged,
+	})
+	withPIDAlive(t, noProcessAlive)
+
+	for i := range 2 {
+		noErr(t, f.u.Repair(), fmt.Sprintf("Repair on start %d", i+1))
+
+		rec, err := f.u.records.load()
+		noErr(t, err, "load the record")
+		eq(t, rec.Status, StatusFailed, fmt.Sprintf("status after start %d", i+1))
+		eq(t, rec.RolledBackVersion, "", "no version is held")
+		held, _, err := f.u.InCooldownFor("1.4.0", time.Now())
+		noErr(t, err, "InCooldownFor")
+		isFalse(t, held, "a target that never ran is not held")
+	}
+}
+
+// The opt-in guard at Repair: a program that never set RetainPrevious keeps
+// exactly v0.3.0's files, even when its committed journal still has a rollback
+// copy (a crash between the commit's journal write and the release).
+func TestRepair_WithoutRetainPreviousRetainsNothing(t *testing.T) {
+	f := newRepairFixture(t, "new-binary", "1.5.0")
+	stageJournal(t, f.u, &state{
+		Phase: phaseCommitted, CommandID: "cmd-1",
+		OldVersion: "1.4.0", TargetVersion: "1.5.0", OldSHA256: sha256Hex([]byte("old-binary")),
+	})
+	writeBinary(t, f.p.RollbackBinary, "old-binary")
+
+	noErr(t, f.u.Repair(), "Repair")
+
+	isFalse(t, exists(f.p.Previous), "nothing is retained")
+	isFalse(t, exists(f.p.PreviousRecord), "no record is written")
+	isTrue(t, exists(f.p.State), "the journal is left for CleanupReported, as in v0.3.0")
+	isTrue(t, exists(f.p.RollbackBinary), "the rollback copy is left for CleanupReported, as in v0.3.0")
+}
+
+// Once the retention a commit could not finish succeeds at start-up, Repair
+// removes the committed journal and the helper copy itself. The documented
+// wiring calls CleanupReported only for a pending outcome, and the outcome was
+// reported on the start that failed, so nothing else would ever remove them -
+// and while the journal stays, Repair never sweeps stale partials.
+func TestRepair_RemovesTheCommittedJournalOnceRetentionSucceeds(t *testing.T) {
+	f := newRepairFixture(t, "new-binary", "1.5.0")
+	f.u.cfg.RetainPrevious = true
+	noErr(t, f.u.records.record(&Outcome{
+		At: time.Now(), ID: "cmd-1", FromVersion: "1.4.0", ToVersion: "1.5.0", Status: StatusSucceeded,
+	}), "seed the committed record")
+	noErr(t, f.u.MarkReported(), "the outcome was reported")
+	stageJournal(t, f.u, &state{
+		Phase: phaseCommitted, CommandID: "cmd-1",
+		OldVersion: "1.4.0", TargetVersion: "1.5.0", OldSHA256: sha256Hex([]byte("old-binary")),
+	})
+	writeBinary(t, f.p.RollbackBinary, "old-binary")
+	writeBinary(t, f.p.HelperCopy, "helper")
+	stale := f.u.partialPath(Request{ID: "cmd-0"})
+	noErr(t, os.WriteFile(stale, []byte("x"), 0o600), "seed a stale partial")
+	backdate(t, stale, 48*time.Hour)
+
+	noErr(t, f.u.Repair(), "Repair")
+
+	eq(t, readFileString(t, f.p.Previous), "old-binary", "retained")
+	isFalse(t, exists(f.p.State), "the committed journal is removed")
+	isFalse(t, exists(f.p.HelperCopy), "the helper copy is removed")
+	isFalse(t, exists(f.p.RollbackBinary), "no rollback copy remains")
+	rec, err := f.u.records.load()
+	noErr(t, err, "load the record")
+	isTrue(t, rec.Reported, "the reported outcome is not resurrected")
+
+	noErr(t, f.u.Repair(), "the next start's Repair")
+	isFalse(t, exists(stale), "the stale-partial sweep runs again")
+}
+
+// Repair removes a committed journal only once its outcome is on record. With a
+// record it cannot read, the journal is the only trace of the update left, so it
+// stays for a later start.
+func TestRepair_KeepsTheCommittedJournalWhileTheOutcomeIsNotOnRecord(t *testing.T) {
+	f := newRepairFixture(t, "new-binary", "1.5.0")
+	f.u.cfg.RetainPrevious = true
+	noErr(t, os.WriteFile(f.p.Record, []byte("{"), 0o600), "corrupt the record")
+	stageJournal(t, f.u, &state{
+		Phase: phaseCommitted, CommandID: "cmd-1",
+		OldVersion: "1.4.0", TargetVersion: "1.5.0", OldSHA256: sha256Hex([]byte("old-binary")),
+	})
+	writeBinary(t, f.p.RollbackBinary, "old-binary")
+
+	noErr(t, f.u.Repair(), "Repair")
+
+	eq(t, readFileString(t, f.p.Previous), "old-binary", "retained")
+	isTrue(t, exists(f.p.State), "the journal stays while the outcome is not on record")
+}
+
+// The other side of the later-record rule: a record OLDER than the decided
+// journal belongs to an earlier update, and does not stand in for this one. A
+// failed exec on Unix journals the rollback and restarts into the old binary
+// without recording anything, so the restored image's Repair has to.
+func TestRepair_RecordsADecidedJournalOverAnEarlierUpdatesRecord(t *testing.T) {
+	f := newRepairFixture(t, "old-binary", "1.3.0")
+	scopeRepairFixture(f)
+	noErr(t, f.u.records.record(&Outcome{
+		At: time.Now().Add(-2 * time.Hour), ID: "cmd-0", FromVersion: "1.2.0", ToVersion: "1.3.0",
+		Status: StatusSucceeded,
+	}), "seed an earlier update's record")
+	stageJournal(t, f.u, &state{
+		Phase: phaseRolledBack, CommandID: "cmd-1",
+		OldVersion: "1.3.0", TargetVersion: "1.4.0", ErrorMessage: "exec failed: exec format error",
+	})
+
+	noErr(t, f.u.Repair(), "Repair")
+
+	rec, err := f.u.records.load()
+	noErr(t, err, "load the record")
+	eq(t, rec.ID, "cmd-1", "the rollback is recorded")
+	eq(t, rec.Status, StatusRolledBack, "status")
+	held, _, err := f.u.InCooldownFor("1.4.0", time.Now())
+	noErr(t, err, "InCooldownFor")
+	isTrue(t, held, "the version that failed to start is held")
 }

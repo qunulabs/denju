@@ -8,6 +8,82 @@ major version is 0, the public API may change between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- `ResumableSource` and `Request.Offset` - a source that declares it honours the offset
+  keeps an interrupted download in a partial named after the request, and the next
+  `Update` of the same request resumes from it after re-hashing what is on disk.
+  `Config.PartialRetention` (default 24 hours) bounds how long a partial is kept.
+
+  Only a broken transfer keeps the partial. A failure to write it (a full disk) deletes
+  it, as v0.3.0 deleted its temp file, and carries no failure kind. A delete that fails is
+  logged at ERROR, and the error says the partial could not be deleted.
+- `ErrDownloadFailed`, `ErrResumeRejected`, `ErrResumedChecksumMismatch`,
+  `ErrChecksumMismatch` and `Result.Cause` - failure kinds for `errors.Is`. `Result.Error`
+  text is unchanged.
+
+  A digest mismatch on a download that resumed from a non-zero offset is
+  `ErrResumedChecksumMismatch`, and `errors.Is(err, ErrChecksumMismatch)` is false for it:
+  the kept bytes, not the artifact, may be what is wrong. The rule for a caller: **retry
+  once from zero; a second mismatch is permanent** (it is then `ErrChecksumMismatch`).
+- `FileSource` - a resumable source over a local file. It refuses anything but a regular
+  file.
+- `Config.RetainPrevious` and `Updater.PreviousBinary` - a commit keeps the replaced
+  binary as `<binary>.<ns>-previous` with a record of its version and SHA-256, so moving
+  back to it needs no download. One generation is kept.
+
+  It is created by the image that commits — the update's target — and needs denju
+  v0.4.0 or later there. A commit by an image on an older denju deletes the replaced
+  binary instead of keeping it. A retention that fails at the commit is retried by
+  `CleanupReported` and by `Repair` on every start, and `Repair` removes the leftover
+  journal once it succeeds.
+- `Config.CooldownScope`, `CooldownRolledBackVersion` and `Updater.InCooldownFor` - a
+  cooldown that holds only the version most recently rolled back.
+
+  The hold needs denju v0.4.0 or later with `CooldownRolledBackVersion` on **both**
+  images. The image rolled back **from** (the update's target) writes it: an attestation
+  failure and a crash loop record the rollback, with the hold, before restoring. The
+  image rolled back **to** enforces it when the next command arrives and carries it
+  forward; an image on an older denju enforces nothing and drops the hold on its next
+  record write (`MarkReported` included, through the 0.3.0 `Outcome` shape). The restored
+  image never adds a hold to a rollback already recorded, so a v0.4.0 program moved back
+  to a build on denju v0.3.0 that then fails is **not** held, and would accept the same
+  move again at once: only the control plane stops that loop.
+
+  A Windows update whose helper died before the swap is recorded as failed and holds
+  nothing under this scope: the target never ran. A helper that is alive but fails the
+  swap itself is still recorded as a rollback, so under this scope that version is held
+  for one cooldown window although it never ran.
+- `Outcome.RolledBackVersion` and `Outcome.RolledBackAt`, maintained under that scope.
+
+### Changed
+
+- `New` rejects `Config.CooldownScope = CooldownRolledBackVersion` paired with a zero or
+  negative `Config.Cooldown`, and rejects a `CooldownScope` value it does not know.
+- `Update` refuses a `Request` that arrives with `Offset` already set; only denju sets it.
+- `Result` gains `Cause`, non-nil on every failure. A consumer comparing two `Result`
+  values with `==` now sees a difference it did not before.
+
+### Fixed
+
+- `Updater.Repair` no longer re-records a decided update's outcome over a later attempt
+  recorded while the journal was still on disk. Re-recording restarted the cooldown at a
+  full window, reported the old outcome a second time, and overwrote the later attempt;
+  it also turned a dead Windows handoff, recorded as failed, into a rollback.
+
+## [0.3.0]
+
+### Added
+
+- `Result.ProgramIntact` - distinguishes an update refused with the program untouched from
+  one that got past the point of no return and could not be undone. Callers should
+  terminate when it is false.
+
+### Fixed
+
+- A commit that cannot be journalled is no longer reversed, and a rollback that fails to
+  restore is no longer reported as a rollback.
+
 ## [0.2.0]
 
 ### Added
@@ -90,7 +166,8 @@ First release.
 - `Logger` — a plain function type, with a `SlogLogger` adapter. Defaults to silence
   rather than to any global logger.
 
-[Unreleased]: https://github.com/qunulabs/denju/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/qunulabs/denju/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/qunulabs/denju/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/qunulabs/denju/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/qunulabs/denju/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/qunulabs/denju/compare/v0.1.0...v0.1.1

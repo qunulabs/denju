@@ -36,7 +36,11 @@ it is a package var so tests observe it instead of dying.
 config.go     Config, Namespace-derived names, validation, defaults
 updater.go    Updater, New, RunProcessRole, ResolveBinary, record accessors
 update.go     Updater.Update — the trigger, and both platform paths
-download.go   staging, hashing, digest check
+errors.go     failure kinds for Result.Cause, kindError
+download.go   fresh and resumable staging, hashing, digest check
+partial.go    partial download naming, listing and discarding
+filesource.go FileSource, the local resumable source
+previous.go   RetainPrevious: retention, its record, PreviousBinary
 state.go      the journal: state, paths, writeState/readState, goos + pidAlive seams
 swap.go       preflightCheck, swapBinary, restoreOldBinary, copyBinary, sha256File
 restart.go    Restart, rollbackAndRestart, relaunchViaHelper, osExit seam
@@ -82,7 +86,10 @@ running, and cleanup would delete `B.old`, destroying the only copy of the old v
 **4. Everything that can fail cheaply happens while the program is untouched.** Platform
 check, cooldown, preflight, download, digest, and a selftest that actually *executes* the
 new binary — all before the drain. The common failures cost a log line and a deleted temp
-file.
+file. The one exception is deliberate: a broken transfer through a `ResumableSource` keeps
+its partial for the retry. A failure to *write* what arrived (a full disk) is not a broken
+transfer — it deletes the partial like any other staged file and carries no failure kind,
+because keeping it would hold the disk that just ran out.
 
 **5. A drain error aborts; a drain TIMEOUT does not.** This is the surprising half and the
 one most likely to be "fixed" by a future reader. A program wedged on stuck work must
@@ -114,6 +121,16 @@ stops matching, which turns "record it once" into "rewrite it on every start".
 **8. Repair must not RE-record an outcome it already recorded.** It runs on every start,
 and each rewrite would push the cooldown anchor forward, turning one failed update into
 an indefinite refusal.
+
+The record holds only the *last* attempt, so "already recorded" cannot mean only "the
+last record matches". A decided journal stays until its outcome is reported, and a later
+attempt (the refusal of a re-issued command) can replace the decided outcome as the
+record meanwhile. `repairDecided` therefore also leaves alone any record written after the
+journal took its verdict — the journal's modification time, since nothing rewrites a
+decided journal. Without that, a report that failed once turned the next refusal into a
+fresh full-length hold and a second report of the old outcome. The same rule keeps a dead
+Windows handoff (journaled `rolledback`, recorded `failed`) from being re-recorded as
+`rolled_back`, which under `CooldownRolledBackVersion` would hold a version that never ran.
 
 **9. A cooldown refusal is recorded but must not move the anchor.** Reset it to the
 refusal's own timestamp and the cooldown extends forever; drop it and the cooldown is
@@ -161,6 +178,60 @@ specified as safe for concurrent use.
 started *before* the program stops serving, so a helper that cannot start aborts the
 update at no cost. This is the opposite order from Unix, on purpose.
 
+**18. A partial is never trusted on its own.** The bytes already on disk are re-hashed
+before anything is appended, and the digest check covers the whole file. A partial that
+fails it is deleted. Skipping the replay "because the bytes were verified as they
+arrived" is wrong: they were never verified, only hashed into a digest that no longer
+exists.
+
+A mismatch after resuming from a non-zero offset is `ErrResumedChecksumMismatch`, not
+`ErrChecksumMismatch`, and `errors.Is` must not match the two. The kept prefix can be
+damaged on the device by a power cut, or a source can ignore the offset, so a resumed
+mismatch does not prove the artifact wrong; the caller retries once from zero, and a
+second mismatch — now `ErrChecksumMismatch` — is permanent. A delete of a partial that
+fails is logged at ERROR and the error must not claim the partial was discarded: its name
+is fixed per request, so the next attempt finds it again.
+
+**19. denju does not restart a download inside one attempt.** When a source rejects the
+offset (`ErrResumeRejected`), denju — not the source — deletes the partial and fails the
+attempt. A silent second transfer would hide a server that cannot serve ranges, and the
+retry policy belongs to the caller.
+
+**20. The retained binary's record never describes another file.** Retention deletes the
+old record before replacing the binary and writes the new one after. It is resumable
+from any point, and runs at the commit, in `CleanupReported`, and in `Repair` on every start
+while the committed journal exists. `CleanupReported` keeps the journal while retention
+fails — the journal is the only thing that says the rollback copy belongs to a committed
+update — but nothing may assume it is called again: the documented wiring calls it only for
+a pending outcome, and the outcome was reported on the start whose retention failed. So
+`Repair` itself removes the committed journal and the leftovers beside it (the Windows
+helper copy and its log) once retention succeeds and the outcome is on record, which also
+lets the stale-partial sweep run again. Without `RetainPrevious` none of this happens, and
+the files are exactly v0.3.0's.
+
+The rollback copy is released only after the commit is *recorded*. A refused commit (a
+record that cannot be written, or a corrupt one under `CooldownRolledBackVersion`) leaves the
+update undecided, and the crash counter's eventual rollback needs `.old` to restore from.
+
+**21. Under `CooldownRolledBackVersion` the hold is carried forward by every write.** The
+record is the last attempt, so a later attempt that did not carry the hold would erase it.
+That makes every write read the previous record first, so a corrupt record fails every
+write under that scope. The default scope reads the previous record only for a refusal,
+exactly as before v0.4.0.
+
+Two images take part in a hold, and both need v0.4.0 with the scope. The image rolled back
+**from** writes it: the attestation verdict and the crash loop both record the rollback
+before restoring. The image rolled back **to** enforces it, in its own `Update`, and carries
+it forward on every later write. Its `Repair` records the rollback only when nothing has
+recorded it — the new version never started (a failed exec on Unix, a failed relaunch by the
+Windows helper), or the other image's record write failed — and it never adds a hold to a
+rollback that is already recorded. So a v0.3.0 image that fails and rolls
+back to a v0.4.0 image leaves that image with no hold: the v0.4.0 image will admit the same
+move again at once. Only the control plane stops that loop.
+
+A dead Windows handoff is recorded `failed` and holds nothing under this scope, on purpose:
+the target never ran.
+
 ---
 
 ## The naming contract
@@ -180,6 +251,11 @@ breaking change to denju's API, which is a much smaller thing.
 
 `B.old` carries no namespace, deliberately: it is the file an operator reaches for at
 three in the morning, and `<binary>.old` is the name they will guess.
+
+The partial download name (including `partialKey`), the retained binary and its record,
+and the JSON tags of `previousRecord` and the new `Outcome` fields are part of the same
+contract, pinned by `TestNamingContract`, `TestPartialKey`,
+`TestPreviousRecordWireCompatibility` and `TestOutcomeWireCompatibility_RollbackAnchor`.
 
 ---
 

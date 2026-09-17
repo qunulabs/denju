@@ -16,7 +16,7 @@ type attestFixture struct {
 	execCh chan struct{}
 }
 
-func newAttestFixture(t *testing.T, phase string) *attestFixture {
+func newAttestFixture(t *testing.T, phase string, apply ...func(*Config)) *attestFixture {
 	t.Helper()
 	withGOOS(t, "linux")
 
@@ -24,13 +24,17 @@ func newAttestFixture(t *testing.T, phase string) *attestFixture {
 	bin := filepath.Join(dir, "prog")
 	writeBinary(t, bin, "new-binary")
 
-	u, err := New(Config{
+	cfg := Config{
 		Namespace:  "app",
 		Version:    "1.5.0", // the TARGET version: this process is the new image
 		BinaryPath: bin,
 		RecordPath: filepath.Join(t.TempDir(), "last-update.json"),
 		Cooldown:   testCooldown,
-	})
+	}
+	for _, fn := range apply {
+		fn(&cfg)
+	}
+	u, err := New(cfg)
 	noErr(t, err, "New")
 	writeBinary(t, u.paths.RollbackBinary, "old-binary")
 
@@ -39,6 +43,7 @@ func newAttestFixture(t *testing.T, phase string) *attestFixture {
 		CommandID:     "cmd-1",
 		OldVersion:    "1.4.0",
 		TargetVersion: "1.5.0",
+		OldSHA256:     sha256Hex([]byte("old-binary")),
 	})
 
 	execCh := make(chan struct{}, 1)

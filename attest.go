@@ -3,7 +3,6 @@ package denju
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 )
 
@@ -117,7 +116,8 @@ func (u *Updater) Commit() error { return u.decide(true, "") }
 // unreachable control plane, a dependency that is down. The previous version is
 // known to have worked and this one has not been shown to, and guessing which of
 // the two a transient failure implicates would be exactly that, a guess. Enable
-// [Config.Cooldown] so a rejected version is not immediately reapplied.
+// [Config.Cooldown] - with [CooldownRolledBackVersion] to hold only this version -
+// so a rejected version is not immediately reapplied.
 //
 // It is a no-op when no update is in flight.
 func (u *Updater) Rollback(cause string) error { return u.decide(false, cause) }
@@ -204,8 +204,9 @@ func (u *Updater) decide(ok bool, cause string) error {
 			u.log(LevelWarn, "could not journal the commit; the outcome record stands", "err", err)
 		}
 		// The rollback copy is released only here - the one point at which the
-		// new version has actually been proven.
-		_ = os.Remove(u.paths.RollbackBinary)
+		// new version has actually been proven. Released means deleted, or kept
+		// as the retained previous binary under Config.RetainPrevious.
+		u.releaseRollbackCopy(j)
 		u.log(LevelInfo, "new version attested healthy; committed",
 			"version", j.TargetVersion,
 			"previous_version", j.OldVersion)

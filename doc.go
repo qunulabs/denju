@@ -109,6 +109,17 @@
 // in any transport. Establishing that a digest is authentic is the caller's job.
 // See SECURITY.md.
 //
+// # Resuming, retaining and holding back
+//
+// A [ResumableSource] keeps an interrupted download for the next [Updater.Update]
+// of the same request, which resumes from [Request.Offset]. [Config.RetainPrevious]
+// keeps the binary a committed update replaced; [Updater.PreviousBinary] reports it
+// and [FileSource] reinstalls it without a network. [Config.CooldownScope] set to
+// [CooldownRolledBackVersion] holds back only the version most recently rolled back.
+// [Result.Cause] carries a failure kind for errors.Is; a digest mismatch after
+// resuming is [ErrResumedChecksumMismatch], not [ErrChecksumMismatch], and the
+// rule for it is to retry once from zero. Use one [Updater] per binary.
+//
 // # Compatibility
 //
 // [Config.Namespace] determines the name of every file denju writes beside the

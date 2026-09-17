@@ -2,6 +2,7 @@ package denju
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -24,12 +25,17 @@ import (
 // that actually EXECUTES the new binary. Only once all of that has passed does
 // the program drain, journal and swap. The common failures - wrong platform,
 // corrupt transfer, unrunnable binary, no disk space, no write permission -
-// therefore cost nothing but a log line and a recorded outcome.
+// therefore cost nothing but a log line and a recorded outcome. The one thing
+// a failure may leave is a [ResumableSource]'s partial after a broken transfer,
+// kept on purpose for the retry; a full disk deletes it.
 //
 // Update is not safe to call concurrently with itself.
 func (u *Updater) Update(ctx context.Context, req Request, src Source) Result {
 	if req.TargetVersion == "" || req.SHA256 == "" {
 		return u.fail(req, "the update request is incomplete: TargetVersion and SHA256 are required")
+	}
+	if req.Offset != 0 {
+		return u.fail(req, "the update request sets Offset, which denju owns: leave it zero")
 	}
 	if req.TargetOS != "" && req.TargetOS != runtime.GOOS ||
 		req.TargetArch != "" && req.TargetArch != runtime.GOARCH {
@@ -42,13 +48,17 @@ func (u *Updater) Update(ctx context.Context, req Request, src Source) Result {
 
 	// The cooldown is checked before anything expensive. Where it matters, it is
 	// the branch most requests take.
-	inCooldown, left, err := u.records.inCooldown(time.Now())
+	inCooldown, left, err := u.records.inCooldownFor(req.TargetVersion, time.Now())
 	if err != nil {
 		return u.fail(req, "could not read the update record: "+err.Error())
 	}
 	if inCooldown {
 		msg := fmt.Sprintf("another update completed less than %s ago; refusing for another %s",
 			u.cfg.Cooldown.Round(time.Minute), left.Round(time.Second))
+		if u.cfg.CooldownScope == CooldownRolledBackVersion {
+			msg = fmt.Sprintf("version %s was rolled back less than %s ago; refusing it for another %s",
+				req.TargetVersion, u.cfg.Cooldown.Round(time.Minute), left.Round(time.Second))
+		}
 		u.log(LevelWarn, "refused by cooldown",
 			"target_version", req.TargetVersion,
 			"current_version", u.cfg.Version,
@@ -81,7 +91,7 @@ func (u *Updater) Update(ctx context.Context, req Request, src Source) Result {
 
 	stagedPath, err := u.download(ctx, req, src)
 	if err != nil {
-		return u.fail(req, err.Error())
+		return u.failErr(req, err)
 	}
 
 	// Execute the new binary before trusting it. This is the last check that
@@ -330,11 +340,17 @@ func (u *Updater) beforeHandoff() {
 
 // fail logs and records a failure that left the program untouched.
 func (u *Updater) fail(req Request, msg string) Result {
+	return u.failErr(req, errors.New(msg))
+}
+
+// failErr is fail for an error whose kind a caller may need: the error itself
+// becomes Result.Cause, so errors.Is still sees the kind.
+func (u *Updater) failErr(req Request, err error) Result {
 	u.log(LevelError, "refused",
 		"target_version", req.TargetVersion,
 		"current_version", u.cfg.Version,
-		"reason", msg)
-	return u.record(req, StatusFailed, msg)
+		"reason", err.Error())
+	return u.recordWith(req, StatusFailed, err, true)
 }
 
 // failJournal is fail for a failure that happened after the journal existed; it
@@ -353,7 +369,7 @@ func (u *Updater) failJournal(j *state, msg string) Result {
 //
 // A request with no ID records nothing: there is nobody to report to.
 func (u *Updater) record(req Request, status Status, msg string) Result {
-	return u.recordWith(req, status, msg, true)
+	return u.recordWith(req, status, errors.New(msg), true)
 }
 
 // abandon records the outcome of an update that got PAST the point of no return
@@ -370,11 +386,12 @@ func (u *Updater) record(req Request, status Status, msg string) Result {
 // the two it is looking at. Deleting it would destroy the evidence and strand
 // the machine.
 func (u *Updater) abandon(j *state, status Status, msg string) Result {
-	return u.recordWith(Request{ID: j.CommandID, TargetVersion: j.TargetVersion}, status, msg, false)
+	return u.recordWith(Request{ID: j.CommandID, TargetVersion: j.TargetVersion}, status, errors.New(msg), false)
 }
 
-func (u *Updater) recordWith(req Request, status Status, msg string, intact bool) Result {
-	res := Result{Status: status, Error: msg, ProgramIntact: intact}
+func (u *Updater) recordWith(req Request, status Status, cause error, intact bool) Result {
+	msg := cause.Error()
+	res := Result{Status: status, Error: msg, Cause: cause, ProgramIntact: intact}
 	if req.ID == "" {
 		return res
 	}

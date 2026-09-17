@@ -43,6 +43,15 @@ type Request struct {
 	// the same time.
 	TargetOS   string
 	TargetArch string
+
+	// Offset is how many bytes of the artifact denju already holds on disk
+	// from an earlier attempt at this same request. denju sets it; a caller
+	// must leave it zero, and [Updater.Update] refuses a request that arrives
+	// with it set.
+	//
+	// Only a [ResumableSource] ever sees a non-zero Offset. Any other Source
+	// always sees zero.
+	Offset int64
 }
 
 // Result is what [Updater.Update] concluded WHEN IT RETURNS.
@@ -54,6 +63,15 @@ type Request struct {
 type Result struct {
 	Status Status
 	Error  string
+
+	// Cause is the error behind Error, for errors.Is. It is nil exactly when
+	// Error is empty. A failed transfer or a failed digest carries a kind -
+	// [ErrDownloadFailed], [ErrResumeRejected], [ErrResumedChecksumMismatch] or
+	// [ErrChecksumMismatch] - so a caller can tell a transfer worth retrying from
+	// one that is not. Every other failure carries its message and no kind,
+	// including the local ones around a download: creating, writing, flushing or
+	// closing the staged file, and reading back a partial.
+	Cause error
 
 	// ProgramIntact reports whether the program may safely carry on running.
 	//
@@ -92,9 +110,41 @@ type Source interface {
 	// denju owns everything around it: creating the temp file in the target
 	// binary's directory so the later rename is atomic, hashing what is written
 	// against [Request.SHA256], making it executable, and deleting it on any
-	// failure. An implementation only has to produce bytes or an error.
+	// failure - except that a failed transfer from a [ResumableSource] keeps
+	// what it wrote, for the next attempt to resume. An implementation only has
+	// to produce bytes or an error, and should return a write error from w
+	// rather than swallow it.
 	//
 	// Fetch may be slow; it is bounded by [Config.DownloadTimeout] and by the
 	// context passed to [Updater.Update].
 	Fetch(ctx context.Context, req Request, w io.Writer) error
+}
+
+// ResumableSource is a [Source] that honours [Request.Offset]: its Fetch writes
+// the artifact starting at that byte, not at the beginning, or returns an error
+// wrapping [ErrResumeRejected] when it cannot.
+//
+// Implementing it changes what denju does with a failed download. For a plain
+// Source a failed Fetch deletes everything written. For a ResumableSource a
+// broken transfer keeps the bytes in a partial named after the request - its
+// ID, TargetVersion and SHA256 - and the next Update with the same three
+// resumes from them, after denju re-hashes what is already on disk. The digest check at the end still
+// covers every byte, old and new.
+//
+// A partial is kept only when the transfer fails. It is deleted when writing
+// to it fails (a full disk), when the source rejects its offset, when the
+// complete file fails the digest, when flushing or closing it after a
+// successful Fetch fails, when a download for a different request starts, and
+// when nothing has written to it for [Config.PartialRetention]. A download
+// through a plain (non-resumable) Source deletes every partial, the same
+// request's included.
+//
+// Use one [Updater] per binary path, across processes as well as within one:
+// two Updaters downloading beside the same binary would each delete the
+// other's partial as belonging to a different request.
+type ResumableSource interface {
+	Source
+	// ResumesFromOffset declares that Fetch honours Request.Offset. denju never
+	// calls it; implementing it is the declaration.
+	ResumesFromOffset()
 }

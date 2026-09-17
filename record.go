@@ -64,6 +64,20 @@ type Outcome struct {
 	//
 	// Maintained by the store; do not set it by hand.
 	CooldownAt time.Time `json:"cooldown_at"`
+	// RolledBackVersion and RolledBackAt name the version most recently rolled
+	// back and when. They are the anchor [CooldownRolledBackVersion] measures
+	// from, and every later record carries them forward until another rollback
+	// replaces them. Empty under any other scope.
+	//
+	// A rollback that fails after it was recorded is rewritten as a failure, and
+	// that rewrite inherits the anchor like any other write: the version stays
+	// held although the machine is still running it. That is harmless - an
+	// update to the version already running is refused before the cooldown is
+	// consulted.
+	//
+	// Maintained by the store; do not set them by hand.
+	RolledBackVersion string    `json:"rolled_back_version,omitempty"`
+	RolledBackAt      time.Time `json:"rolled_back_at,omitzero"`
 }
 
 // store reads and writes the outcome record.
@@ -71,6 +85,7 @@ type store struct {
 	path       string
 	tmpPattern string
 	cooldown   time.Duration
+	scope      CooldownScope
 }
 
 // load returns the stored outcome, or nil when there is none.
@@ -136,26 +151,56 @@ func (s *store) save(o *Outcome) error {
 // existing anchor. A refusal that reset the anchor to its own timestamp would
 // extend the cooldown forever; one that dropped it would let a caller bypass the
 // cooldown simply by retrying.
+//
+// Under [CooldownRolledBackVersion] the rollback anchor follows a stricter rule
+// of its own: only a rollback moves it, to that rollback's version and time.
+// Every other write - a success, a failure, and a refusal alike - inherits it
+// from the previous record. The record holds only the LAST attempt, so without
+// that carry-forward an unrelated failed download would erase the hold.
 func (s *store) record(o *Outcome) error {
-	if o.Status == StatusRefusedCooldown {
-		prev, err := s.load()
-		if err != nil {
+	// The previous record is needed for a refusal (to inherit its anchor), and
+	// under the scoped cooldown for EVERY write (to carry the hold forward).
+	// Loading it only then keeps the default scope byte-for-byte as it was: a
+	// corrupt record is simply overwritten by a completed attempt.
+	var prev *Outcome
+	if o.Status == StatusRefusedCooldown || s.scope == CooldownRolledBackVersion {
+		var err error
+		if prev, err = s.load(); err != nil {
 			return err
 		}
+	}
+	if o.Status == StatusRefusedCooldown {
 		if prev != nil {
 			o.CooldownAt = prev.CooldownAt
 		}
 	} else {
 		o.CooldownAt = o.At
 	}
+	if s.scope == CooldownRolledBackVersion {
+		switch {
+		case o.Status == StatusRolledBack:
+			o.RolledBackVersion, o.RolledBackAt = o.ToVersion, o.At
+		case prev != nil:
+			o.RolledBackVersion, o.RolledBackAt = prev.RolledBackVersion, prev.RolledBackAt
+		}
+	}
 	return s.save(o)
 }
 
-// inCooldown reports whether an update completed recently enough to refuse
-// another, and how long is left. It reads the anchor record maintains, so
-// refusals in between are invisible here - they neither extend the window nor
-// cut it short.
+// inCooldown reports whether ANY update would be refused now: every update
+// under CooldownAnyUpdate, the held version under CooldownRolledBackVersion.
 func (s *store) inCooldown(now time.Time) (bool, time.Duration, error) {
+	return s.check(now, func(*Outcome) bool { return true })
+}
+
+// inCooldownFor reports whether an update to target would be refused now.
+func (s *store) inCooldownFor(target string, now time.Time) (bool, time.Duration, error) {
+	return s.check(now, func(o *Outcome) bool { return o.RolledBackVersion == target })
+}
+
+// check measures the window from the anchor the scope uses. Refusals in between
+// are invisible here - record keeps them from moving either anchor.
+func (s *store) check(now time.Time, held func(*Outcome) bool) (bool, time.Duration, error) {
 	if s.cooldown <= 0 {
 		return false, 0, nil
 	}
@@ -163,10 +208,20 @@ func (s *store) inCooldown(now time.Time) (bool, time.Duration, error) {
 	if err != nil {
 		return false, 0, err
 	}
-	if o == nil || o.CooldownAt.IsZero() {
+	if o == nil {
 		return false, 0, nil
 	}
-	elapsed := now.Sub(o.CooldownAt)
+	anchor := o.CooldownAt
+	if s.scope == CooldownRolledBackVersion {
+		if o.RolledBackVersion == "" || !held(o) {
+			return false, 0, nil
+		}
+		anchor = o.RolledBackAt
+	}
+	if anchor.IsZero() {
+		return false, 0, nil
+	}
+	elapsed := now.Sub(anchor)
 	// A negative elapsed means the record is dated in the future - a clock that
 	// jumped backwards, or a record copied from another host. Holding an update
 	// back until wall-clock time catches up could mean holding it for years, so

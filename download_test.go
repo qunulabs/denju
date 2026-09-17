@@ -51,8 +51,12 @@ func TestDownload_ChecksumMismatchRemovesTheStagedFile(t *testing.T) {
 	u := downloadTestUpdater(t)
 	src := &fakeSource{payload: []byte("new bytes")}
 
-	_, err := u.download(context.Background(), Request{SHA256: sha256Hex([]byte("different"))}, src)
+	want := sha256Hex([]byte("different"))
+	_, err := u.download(context.Background(), Request{SHA256: want}, src)
 	wantErrContaining(t, err, "checksum", "download with a bad digest")
+	// A plain Source keeps v0.3.0's exact wording: consumers log and match it.
+	eq(t, err.Error(), "the downloaded update does not match its checksum: expected "+want+", got "+sha256Hex([]byte("new bytes")),
+		"the plain-source message is unchanged")
 
 	entries, err := os.ReadDir(filepath.Dir(u.binaryPath))
 	noErr(t, err, "read the install directory")
@@ -127,3 +131,14 @@ func TestDownload_SourceOnlySeesAWriter(t *testing.T) {
 type writerFuncSource func(io.Writer) error
 
 func (f writerFuncSource) Fetch(_ context.Context, _ Request, w io.Writer) error { return f(w) }
+
+// A source that overruns DownloadTimeout failed to download, whatever its own
+// error says.
+func TestDownload_TimeoutIsADownloadFailure(t *testing.T) {
+	u := downloadTestUpdater(t)
+	u.cfg.DownloadTimeout = 30 * time.Millisecond
+
+	_, err := u.download(context.Background(), Request{SHA256: "irrelevant"}, slowSource{})
+	isTrue(t, errors.Is(err, ErrDownloadFailed), "a timed-out download is a download failure")
+	isTrue(t, errors.Is(err, context.DeadlineExceeded), "the deadline stays reachable")
+}
